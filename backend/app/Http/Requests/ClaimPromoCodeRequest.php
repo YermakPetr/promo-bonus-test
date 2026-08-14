@@ -24,7 +24,12 @@ class ClaimPromoCodeRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'code' => ['required', 'string', 'min:6', 'max:12', 'regex:/^[A-Za-z0-9]+$/'],
+            // "bail" stops at the first failing rule for this field, so the
+            // API always returns exactly one clear error message instead of
+            // Laravel's default "X (and N more errors)" summary when
+            // multiple rules fail at once (e.g. a code that's both too
+            // short and contains invalid characters).
+            'code' => ['bail', 'required', 'string', 'min:6', 'max:12', 'regex:/^[A-Za-z0-9]+$/'],
         ];
     }
 
@@ -37,6 +42,7 @@ class ClaimPromoCodeRequest extends FormRequest
     {
         return [
             'code.required' => 'Promo code is required.',
+            'code.string' => 'Promo code must be text.',
             'code.min' => 'Promo code must be between 6 and 12 characters long.',
             'code.max' => 'Promo code must be between 6 and 12 characters long.',
             'code.regex' => 'Promo code may only contain Latin letters and digits.',
