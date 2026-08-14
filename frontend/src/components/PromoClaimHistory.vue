@@ -2,6 +2,8 @@
 import { onMounted, ref, watch } from 'vue'
 import api from '../services/api'
 
+const emit = defineEmits(['revoked'])
+
 const claims = ref([])
 const currentPage = ref(1)
 const lastPage = ref(1)
@@ -9,6 +11,8 @@ const total = ref(0)
 const statusFilter = ref('')
 const loading = ref(false)
 const errorMessage = ref('')
+const revokingIds = ref(new Set())
+const revokeErrors = ref({})
 
 const statusOptions = [
   { value: '', label: 'All' },
@@ -58,6 +62,29 @@ function prependClaim(claim) {
 
 defineExpose({ prependClaim })
 
+async function revokeClaim(claim) {
+  if (revokingIds.value.has(claim.id)) return
+  if (!window.confirm(`Скасувати застосування промокоду на суму ${claim.amount}?`)) return
+
+  revokingIds.value.add(claim.id)
+  delete revokeErrors.value[claim.id]
+
+  try {
+    const { data } = await api.patch(`/promo/${claim.id}/revoke`)
+
+    const index = claims.value.findIndex((c) => c.id === claim.id)
+    if (index !== -1) {
+      claims.value[index] = { ...claims.value[index], status: data.claim.status }
+    }
+
+    emit('revoked', { claim: data.claim, balance: data.balance })
+  } catch (error) {
+    revokeErrors.value[claim.id] = error.response?.data?.message || 'Failed to revoke this claim.'
+  } finally {
+    revokingIds.value.delete(claim.id)
+  }
+}
+
 onMounted(() => fetchHistory())
 </script>
 
@@ -82,6 +109,7 @@ onMounted(() => fetchHistory())
           <th>Date</th>
           <th>Amount</th>
           <th>Status</th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
@@ -92,6 +120,21 @@ onMounted(() => fetchHistory())
             <span :class="['promo-history__status', `promo-history__status--${claim.status}`]">
               {{ claim.status }}
             </span>
+          </td>
+          <td>
+            <div v-if="claim.status === 'applied'" class="promo-history__actions">
+              <button
+                type="button"
+                class="promo-history__revoke"
+                :disabled="revokingIds.has(claim.id)"
+                @click="revokeClaim(claim)"
+              >
+                {{ revokingIds.has(claim.id) ? 'Скасування…' : 'Скасувати' }}
+              </button>
+              <p v-if="revokeErrors[claim.id]" class="promo-history__message promo-history__message--error">
+                {{ revokeErrors[claim.id] }}
+              </p>
+            </div>
           </td>
         </tr>
       </tbody>
@@ -183,6 +226,35 @@ onMounted(() => fetchHistory())
 .promo-history__status--revoked {
   background: rgba(220, 38, 38, 0.12);
   color: #dc2626;
+}
+
+.promo-history__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  align-items: flex-start;
+}
+
+.promo-history__revoke {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--bg);
+  color: #dc2626;
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.promo-history__revoke:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.promo-history__actions .promo-history__message--error {
+  margin: 0;
+  font-size: 0.75rem;
 }
 
 .promo-history__pagination {

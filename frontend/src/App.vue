@@ -21,6 +21,10 @@ function handleClaimed({ claim, balance: newBalance }) {
   balance.value = newBalance
   historyRef.value?.prependClaim(claim)
 }
+
+function handleRevoked({ balance: newBalance }) {
+  balance.value = newBalance
+}
 </script>
 
 <template>
@@ -32,6 +36,6 @@ function handleClaimed({ claim, balance: newBalance }) {
 
     <PromoClaimForm @claimed="handleClaimed" />
 
-    <PromoClaimHistory ref="historyRef" />
+    <PromoClaimHistory ref="historyRef" @revoked="handleRevoked" />
   </main>
 </template>
