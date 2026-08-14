@@ -55,4 +55,35 @@ class PromoClaimService
             return $claim;
         });
     }
+
+    /**
+     * Revoke a previously applied promo claim, debiting the player's balance.
+     *
+     * @throws PromoClaimException
+     */
+    public function revoke(Player $player, int $claimId): PromoClaim
+    {
+        return DB::transaction(function () use ($player, $claimId) {
+            $claim = PromoClaim::where('id', $claimId)->lockForUpdate()->first();
+
+            if (! $claim) {
+                throw PromoClaimException::claimNotFound();
+            }
+
+            if ($claim->player_id !== $player->id) {
+                throw PromoClaimException::claimNotOwned();
+            }
+
+            if ($claim->status === 'revoked') {
+                throw PromoClaimException::claimAlreadyRevoked();
+            }
+
+            $claim->status = 'revoked';
+            $claim->save();
+
+            $player->decrement('balance', $claim->amount);
+
+            return $claim;
+        });
+    }
 }

@@ -25,4 +25,19 @@ class PromoClaimException extends Exception
     {
         return new self('You have already claimed this promo code.', 409);
     }
+
+    public static function claimNotFound(): self
+    {
+        return new self('Promo claim not found.', 404);
+    }
+
+    public static function claimNotOwned(): self
+    {
+        return new self('This promo claim does not belong to you.', 403);
+    }
+
+    public static function claimAlreadyRevoked(): self
+    {
+        return new self('This promo claim has already been revoked.', 409);
+    }
 }

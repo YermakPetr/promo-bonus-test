@@ -17,4 +17,5 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::post('/promo/claim', [PromoController::class, 'claim']);
     Route::get('/promo/history', [PromoController::class, 'history']);
+    Route::patch('/promo/{claimId}/revoke', [PromoController::class, 'revoke'])->whereNumber('claimId');
 });
