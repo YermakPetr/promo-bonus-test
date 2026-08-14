@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Player;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
@@ -22,6 +23,12 @@ class AuthController extends Controller
             'name' => $validated['name'],
             'email' => $validated['email'],
             'password' => Hash::make($validated['password']),
+        ]);
+
+        Player::create([
+            'user_id' => $user->id,
+            'name' => $user->name,
+            'balance' => 0,
         ]);
 
         $token = $user->createToken('api-token')->plainTextToken;

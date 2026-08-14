@@ -2,6 +2,7 @@
 
 namespace Database\Seeders;
 
+use App\Models\Player;
 use App\Models\User;
 use Illuminate\Database\Console\Seeds\WithoutModelEvents;
 use Illuminate\Database\Seeder;
@@ -17,10 +18,15 @@ class DatabaseSeeder extends Seeder
     {
         // User::factory(10)->create();
 
-        User::factory()->create([
+        $testUser = User::factory()->create([
             'name' => 'Test User',
             'email' => 'test@example.com',
         ]);
+
+        Player::query()->firstOrCreate(
+            ['user_id' => $testUser->id],
+            ['name' => $testUser->name, 'balance' => 0]
+        );
 
         $this->call(PromoBonusSeeder::class);
     }
