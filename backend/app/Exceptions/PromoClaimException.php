@@ -40,4 +40,9 @@ class PromoClaimException extends Exception
     {
         return new self('This promo claim has already been revoked.', 409);
     }
+
+    public static function insufficientBalance(): self
+    {
+        return new self('Insufficient balance to revoke this promo claim.', 409);
+    }
 }

@@ -45,8 +45,6 @@ class PromoClaimService
                     'amount' => $promoCode->amount,
                 ]);
             } catch (UniqueConstraintViolationException) {
-                // The DB-level unique index is the final guard against a
-                // duplicate claim slipping through a race condition.
                 throw PromoClaimException::alreadyClaimed();
             }
 
@@ -61,10 +59,18 @@ class PromoClaimService
      *
      * @throws PromoClaimException
      */
+
     public function revoke(Player $player, int $claimId): PromoClaim
     {
         return DB::transaction(function () use ($player, $claimId) {
-            $claim = PromoClaim::where('id', $claimId)->lockForUpdate()->first();
+            $player = Player::query()
+                ->whereKey($player->id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            $claim = PromoClaim::where('id', $claimId)
+                ->lockForUpdate()
+                ->first();
 
             if (! $claim) {
                 throw PromoClaimException::claimNotFound();
@@ -76,6 +82,10 @@ class PromoClaimService
 
             if ($claim->status === 'revoked') {
                 throw PromoClaimException::claimAlreadyRevoked();
+            }
+
+            if ($player->balance < $claim->amount) {
+                throw PromoClaimException::insufficientBalance();
             }
 
             $claim->status = 'revoked';
