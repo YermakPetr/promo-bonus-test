@@ -4,24 +4,34 @@ Kaggriculture agent.
 Strategy in one paragraph: every turn we rebuild a prioritized task list straight
 from the observation (no persistent memory needed) -- feed/water first (losing an
 animal or plant to neglect is the worst outcome), then harvest, then upkeep
-(care/dig/collect fertilizer/deliver purchased animals & collected fertilizer),
-then expansion (plant/build coops&pastures) -- and greedily assign the farmer +
-every hired hand to the nearest unclaimed task each turn. Crop/animal choice for
-empty tiles is scored live against current market prices ($ per tile per day),
-with soft per-type caps so we never dump all output into one glutted product,
-and an early-game bias toward fast-payback crops (wheat/carrot) so we aren't
-cash-starved while tomato/melon are still maturing. Land and hires are bought
-whenever the payoff clearly justifies the cost given days remaining. Selling is
-metered against a price floor except in the final days, when everything is
-liquidated since unsold inventory is worth nothing at game end.
+(care rides at the same top priority as feed/water since it's a free action and
+the bank it builds is what turns a cow's first milking into 6 units instead of 1;
+dig/collect fertilizer/deliver purchased animals & collected fertilizer), then
+expansion (plant/build coops&pastures) -- and greedily assign the farmer + every
+hired hand to the nearest unclaimed task each turn. Crop/animal choice for empty
+tiles is scored against current market price plus two forward-looking demand
+terms: permanent per-shop demand (a shop never closes once unlocked, so its
+demand is known the moment it opens, not just once price reacts to it) and, for
+the resources priced with a "hinge" scarcity curve (carrot/tomato/egg -- flat
+until inventory crosses a threshold below I0, then a hard spike), how far
+inventory already sits toward that threshold -- watching price alone catches the
+spike after it's under way, watching inventory catches the approach while still
+cheap to commit to. Soft per-type tile-share caps keep output diversified so we
+never dump everything into one glutted product, with an early-game bias toward
+fast-payback crops (wheat/carrot) so we aren't cash-starved while tomato/melon
+are still maturing. Land and hires are bought whenever the payoff clearly
+justifies the cost given days remaining. Selling is metered against a price
+floor except in the final days, when everything is liquidated since unsold
+inventory is worth nothing at game end.
 
 Rules were taken from the installed kaggle_environments kaggriculture.py
 (v0.1.0), which differs in a few places from earlier drafts of the docs:
 market uses a "hinge" shape for a few resources on the scarcity side (doesn't
 affect our selling-side math, which uses the "above I0" curve, unchanged),
 shedCapacity blocks BUY_PRODUCT/BUY_ANIMAL once the shed is full, town center
-demand is a flat 1/day (no day-10/20 ramp), and DROP/PICKUP/PLACE work from
-shed-adjacent tiles even in a not-yet-purchased (LOCKED) quadrant.
+demand is a flat 1/day (no day-10/20 ramp), DROP/PICKUP/PLACE work from
+shed-adjacent tiles even in a not-yet-purchased (LOCKED) quadrant, and the
+animal CARE bank accrues +1/day (not +2 as some drafts of the docs claim).
 """
 
 # ---------------------------------------------------------------------------
@@ -48,6 +58,32 @@ BASE_PRICE = {
     "WHEAT": 25, "CARROT": 35, "TOMATO": 60, "STRAWBERRY": 120, "MELON": 250,
     "EGG": 50, "MILK": 160, "WOOL": 200, "FERTILIZER": 100,
 }
+
+# Town shops: once unlocked a shop never closes and consumes its listed
+# products forever (single-product shops pull 2x). This is a deterministic,
+# permanent demand signal -- no need to wait for price to catch up once we
+# see which shops are open.
+SHOPS = {
+    "BAKERY":         ["EGG", "WHEAT"],
+    "PIZZA_SHOP":     ["MILK", "TOMATO", "WHEAT"],
+    "BRUNCH_SPOT":    ["EGG", "WHEAT", "STRAWBERRY"],
+    "YARN_STORE":     ["WOOL"],
+    "ICE_CREAM_SHOP": ["STRAWBERRY", "MILK", "WHEAT"],
+    "PET_CAFE":       ["CARROT"],
+    "SMOOTHIE_SHOP":  ["STRAWBERRY", "MILK"],
+    "FARMERS_MARKET": ["WHEAT", "CARROT", "TOMATO", "STRAWBERRY"],
+}
+SHOP_DEMAND_WEIGHT = 15  # $ score per shop-instance-unit of permanent demand
+
+# The installed game (not the docs) prices CARROT/TOMATO/EGG with a "hinge"
+# curve on the scarcity side: calm while inventory sits within T of I0, then
+# a hard quadratic spike once it drops further. Current price alone catches
+# the spike late; watching inventory trend toward the T threshold catches it
+# while the crop is still cheap to commit to (relevant for tomato especially,
+# which takes 8 days to first yield).
+MARKET_I0 = 10000
+HINGE_SCARCITY = {"CARROT": 450, "TOMATO": 200, "EGG": 332}  # product -> T
+SCARCITY_WEIGHT = 30
 
 # Max sellable yield per tile per day at optimal (unfertilized) care -- matches
 # the README's own table; used to rank crop/animal ROI.
@@ -157,6 +193,7 @@ def agent(obs):
     me = farms[player]
     private = obs.get("private", {}) or {}
     market = obs.get("market", {}) or {}
+    town = obs.get("town", {}) or {}
     day = obs.get("day", 0)
     hour = obs.get("hour", 0)
 
@@ -166,6 +203,8 @@ def agent(obs):
     seeds = private.get("seeds", {}) or {}
     inventories = list(private.get("inventories", [{}]) or [{}])
     prices = market.get("prices", {}) or {}
+    market_inventory = market.get("inventory", {}) or {}
+    unlocked_shops = town.get("unlocked_shops", []) or []
     money = me.get("money", 0)
 
     units = [me["farmer"]] + list(me.get("hands", []))
@@ -191,7 +230,10 @@ def agent(obs):
     # ------------------------------------------------------------------
     tasks = {1: [], 2: [], 3: [], 4: []}
 
-    plant_targets, animal_build_targets = _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down)
+    plant_targets, animal_build_targets = _plan_expansion(
+        tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
+        market_inventory, unlocked_shops,
+    )
 
     empty_structures = {"COOP": [], "PASTURE": []}
     eligible_fertilize_targets = []
@@ -254,13 +296,21 @@ def agent(obs):
     # skipping it can be total -- a plant not watered on the day it's planted
     # turns to a weed at the very next end-of-day refresh (planting itself
     # already counts as one unwatered day), and an animal is only one more
-    # missed day from escaping for good.
+    # missed day from escaping for good. CARE rides along at the same priority
+    # when standing on an already-fed animal: it's free, and skipping it costs
+    # a whole day of banked bonus toward the animal's next payout (the bank is
+    # what turns a fresh cow's first milking into 6 units instead of 1).
     tier1_by_pos = {t[1]: t for t in tasks[1]}
+    care_by_pos = {t[1]: t for t in tasks[3] if t[0] == "CARE"}
     for i in range(n_units):
         pos = tuple(units[i])
         if pos in tier1_by_pos:
             op, tpos, extra = tier1_by_pos.pop(pos)
             tasks[1].remove((op, tpos, extra))
+            unit_actions[i] = _finalize_tile_action(op, extra)
+        elif pos in care_by_pos:
+            op, tpos, extra = care_by_pos.pop(pos)
+            tasks[3].remove((op, tpos, extra))
             unit_actions[i] = _finalize_tile_action(op, extra)
 
     # 2a. Units already carrying fertilizer / an animal act on that cargo first
@@ -379,7 +429,7 @@ def agent(obs):
         projected_shed=projected_shed, n_animals_alive=n_animals_alive,
         endgame=endgame, wind_down=wind_down, remaining_days=remaining_days,
         animal_build_targets=animal_build_targets, empty_structures=empty_structures,
-        tiles=tiles, board_size=board_size,
+        tiles=tiles, board_size=board_size, unlocked_shops=unlocked_shops,
     )
 
     return {"farmer": farmer_action, "hands": hands_actions, "market": market_orders}
@@ -427,16 +477,38 @@ def _finalize_tile_action(op, extra):
 # Economics: what to plant / build next
 # ---------------------------------------------------------------------------
 
-def _crop_score(crop, prices):
+def _demand_bonus(product, market_inventory, unlocked_shops):
+    """Forward-looking demand beyond current price: permanent per-shop demand
+    (deterministic and monotonic -- a shop never closes) plus, for the
+    hinge-priced scarcity items, how far inventory already sits toward the
+    spike threshold. Current price alone reacts only once the spike is under
+    way; this catches the approach while the crop is still cheap to commit
+    to, which matters most for the slow-maturing ones (tomato: 8 days)."""
+    bonus = 0.0
+    for shop in unlocked_shops:
+        products = SHOPS.get(shop, ())
+        if product in products:
+            bonus += SHOP_DEMAND_WEIGHT * (2 if len(products) == 1 else 1)
+    T = HINGE_SCARCITY.get(product)
+    if T:
+        inv = market_inventory.get(product, MARKET_I0)
+        ratio = max(0.0, MARKET_I0 - inv) / T
+        bonus += SCARCITY_WEIGHT * min(ratio, 1.5)
+    return bonus
+
+
+def _crop_score(crop, prices, market_inventory, unlocked_shops):
     price = prices.get(crop, BASE_PRICE[crop])
-    return YIELD_PER_TILE_DAY[crop] * price - AMORTIZED_COST_PER_DAY[crop]
+    base = YIELD_PER_TILE_DAY[crop] * price - AMORTIZED_COST_PER_DAY[crop]
+    return base + _demand_bonus(crop, market_inventory, unlocked_shops)
 
 
-def _animal_score(animal, prices):
+def _animal_score(animal, prices, market_inventory, unlocked_shops):
     product = ANIMAL_PRODUCT[animal]
     price = prices.get(product, BASE_PRICE[product])
     feed_cost_per_day = prices.get("WHEAT", BASE_PRICE["WHEAT"])  # ~1 wheat/day/animal
-    return YIELD_PER_TILE_DAY[animal] * price - AMORTIZED_COST_PER_DAY[animal] - feed_cost_per_day
+    base = YIELD_PER_TILE_DAY[animal] * price - AMORTIZED_COST_PER_DAY[animal] - feed_cost_per_day
+    return base + _demand_bonus(product, market_inventory, unlocked_shops)
 
 
 def _pick_diversified(ranked, counts, unlocked_tiles):
@@ -453,7 +525,8 @@ def _pick_diversified(ranked, counts, unlocked_tiles):
     return min(ranked, key=lambda c: counts.get(c, 0) / max(TILE_SHARE_CAP[c] * unlocked_tiles, 0.01))
 
 
-def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down):
+def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
+                     market_inventory, unlocked_shops):
     """Decide what goes on currently-empty tiles: returns (plant_targets, animal_build_targets),
     both {(x, y): value}, splitting the empty-tile pool between crops and new
     animal structures and respecting soft diversification caps."""
@@ -493,7 +566,7 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
     if not wind_down or remaining_days >= 4:
         ranked_crops = sorted(
             (c for c in CROPS if seeds.get(c, 0) > 0 and (not wind_down or remaining_days >= CROPS[c]["max_yield_day"] + 2)),
-            key=lambda c: -_crop_score(c, prices),
+            key=lambda c: -_crop_score(c, prices, market_inventory, unlocked_shops),
         )
         if ranked_crops:
             for pos in crop_slots:
@@ -503,7 +576,7 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
 
     animal_build_targets = {}
     if animal_slots:
-        ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices))
+        ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops))
         reserve = 400
         for pos in animal_slots:
             best = _pick_diversified(ranked_animals, animal_counts, unlocked_tiles)
@@ -522,10 +595,11 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
 
 def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive,
                   endgame, wind_down, remaining_days, animal_build_targets,
-                  empty_structures, tiles, board_size):
+                  empty_structures, tiles, board_size, unlocked_shops):
     orders = []
     money = me.get("money", 0)
     prices = market.get("prices", {}) or {}
+    market_inventory = market.get("inventory", {}) or {}
     seeds = private.get("seeds", {}) or {}
     unlocked = me.get("unlocked_quadrants", ["NW"])
     shed_total = sum(projected_shed.values())
@@ -612,7 +686,7 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
     if budget > 0 and not wind_down:
         def seed_key(c):
             is_fast = c in BOOTSTRAP_CROPS
-            return (0 if (bootstrapping and is_fast) else 1, -_crop_score(c, prices))
+            return (0 if (bootstrapping and is_fast) else 1, -_crop_score(c, prices, market_inventory, unlocked_shops))
 
         for crop in sorted(CROPS, key=seed_key):
             if budget <= 0:
@@ -645,7 +719,7 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
         for op in animal_build_targets.values():
             struct = "COOP" if op == "BUILD_COOP" else "PASTURE"
             waiting[struct] = waiting.get(struct, 0) + 1
-        for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, prices)):
+        for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops)):
             if budget <= 0:
                 break
             struct = ANIMALS[animal]["structure"]
