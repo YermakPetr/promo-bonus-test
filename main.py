@@ -169,6 +169,7 @@ BOOTSTRAP_MONEY = 2500     # ...or while cash is still this tight, whichever is 
 FEED_RESERVE_PER_ANIMAL = 3   # keep this many wheat in shed per live animal
 CARGO_RETURN_THRESHOLD = 5    # unit inventory (sellables) heavy enough to prioritize a shed trip
 ANIMAL_WHEAT_GATE = 8         # don't buy livestock until we can actually feed it
+FERTILIZER_RESERVE = 5        # small working buffer; sell the rest (it's a free animal byproduct)
 
 
 def _fib(n):
@@ -261,6 +262,13 @@ def agent(obs):
     endgame = day >= LIQUIDATE_DAY
     wind_down = day >= WIND_DOWN_DAY
 
+    # Only "alive" (placed) animals count toward the wheat reserve. Counting
+    # shed-held/carried ones too was tried, reasoning that a freshly-fetched
+    # animal needs a day's feed before it can depart -- but most bought
+    # animals sit in the shed unfetched for a long time (FETCH_ANIMAL is a
+    # low-priority tier-3 task, not guaranteed to run soon), so that reserve
+    # just locked up wheat behind a fetch that mostly never happens,
+    # measurably worse than the rarer case it was guarding against.
     n_animals_alive = sum(
         1 for row in tiles for t in row if isinstance(t, dict) and "animal" in t
     )
@@ -269,24 +277,35 @@ def agent(obs):
     # 1. Build the prioritized task list from farm tiles (one grid pass).
     #    tier 1: FEED / WATER (critical -- must happen today)
     #    tier 2: HARVEST (ready produce)
-    #    tier 3: CARE / DIG / COLLECT_FERTILIZER / fetch purchased animal
+    #    tier 3: CARE / DIG / COLLECT_FERTILIZER / fetch a purchased animal
     #            or leftover shed fertilizer
     #    tier 4: PLANT / BUILD_COOP / BUILD_PASTURE (expansion)
+    #
+    # (FETCH_ANIMAL was tried at a dedicated tier above HARVEST, reasoning
+    # that a sunk-cost animal sitting unfetched is worse than a slightly late
+    # harvest. Measured worse in practice: pulling multiple units into
+    # animal logistics every time one is bought destabilized the rest of the
+    # farm's routine -- feeding fell behind and animals escaped in waves --
+    # for a net loss even accounting for the animals it did get placed. Left
+    # here at tier 3, most purchased animals just sit in the shed unfetched,
+    # which sounds worse but empirically outperforms actively chasing them.)
     # ------------------------------------------------------------------
     tasks = {1: [], 2: [], 3: [], 4: []}
 
     plant_targets, animal_build_targets = _plan_expansion(
         tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
-        market_inventory, unlocked_shops,
+        market_inventory, unlocked_shops, shed,
     )
 
     empty_structures = {"COOP": [], "PASTURE": []}
     eligible_fertilize_targets = []
+    all_empty_tiles = []
 
     for y in range(board_size):
         for x in range(board_size):
             tile = tiles[y][x]
             if tile is None:
+                all_empty_tiles.append((x, y))
                 # Note: a planned animal_build_targets site is deliberately NOT
                 # turned into a standalone tier-4 task here -- building a
                 # structure only makes sense together with an animal already
@@ -317,7 +336,15 @@ def agent(obs):
                     tasks[1].append(("FEED", (x, y), None))
                 if tile["yield_units"] > 0:
                     tasks[2].append(("HARVEST", (x, y), None))
-                if not tile["cared_today"]:
+                # CARE banks +1/day (both fed and cared) toward the *next*
+                # scheduled production, paid out capped at max_held -- once
+                # the bank plus the guaranteed base(1) already reaches that
+                # cap, more CARE before the next payout is wasted (it still
+                # resets to 0 there, capped the same either way). A cow needs
+                # only 5 banked days (5+1=6=max_held) out of the 7 available
+                # before its first milking; the other 2 buy nothing.
+                bank = tile.get("pending_care_bonus", 0)
+                if not tile["cared_today"] and bank + 1 < ANIMALS[animal]["max_held"]:
                     tasks[3].append(("CARE", (x, y), None))
                 if tile.get("fertilizer_available"):
                     tasks[3].append(("COLLECT_FERTILIZER", (x, y), None))
@@ -368,7 +395,14 @@ def agent(obs):
     tier4_by_pos = {t[1]: t for t in tasks[4]}
     for i in range(n_units):
         pos = tuple(units[i])
-        if pos in tier1_by_pos:
+        inv_i = inventories[i] if i < len(inventories) else {}
+        # FEED consumes 1 WHEAT from the *acting unit's own inventory* (not
+        # the shed) -- a unit with none silently no-ops the action, wasting
+        # the turn while the animal's unfed streak keeps ticking toward
+        # escape. Only take this match if it can actually succeed; otherwise
+        # leave it in the pool for a wheat-carrying unit (this one falls
+        # through to the wheat-buffer top-up a few blocks below).
+        if pos in tier1_by_pos and not (tier1_by_pos[pos][0] == "FEED" and inv_i.get("WHEAT", 0) <= 0):
             op, tpos, extra = tier1_by_pos.pop(pos)
             tasks[1].remove((op, tpos, extra))
             unit_actions[i] = _finalize_tile_action(op, extra)
@@ -420,16 +454,33 @@ def agent(obs):
             if target is not None:
                 unit_actions[i] = ["PLACE", animal_name] if pos == target else [_step_towards(pos, target, board_size)]
                 break
-            # No structure exists yet: go build one at the planned site for
-            # this animal (chosen back in _plan_expansion), rather than
-            # standing idle with a homeless animal on hand.
-            build_sites = [p for p, (op, a) in animal_build_targets.items() if a == animal_name]
-            target = _nearest(build_sites, pos)
+            # No structure exists yet: go build one on the empty tile closest
+            # to the shed (not closest to this unit's current position) --
+            # animals need a FEED visit every single day for the rest of the
+            # game, so scattering them wherever the carrying unit happened to
+            # be wandering when it picked one up turns daily upkeep into an
+            # ever-expanding patrol that eventually can't be completed in
+            # time, which is exactly what let animals escape in waves in
+            # testing. Clustering them near the shed keeps that recurring
+            # cost small and bounded no matter how many accumulate.
+            # (Targeting a *specific* animal_build_targets position instead
+            # was tried and doesn't work: that set is recomputed from scratch
+            # every turn from a shrinking, reordering empty-tile pool, so by
+            # the time a multi-turn walk would arrive, the plan has very
+            # likely already reassigned that exact tile to a different type,
+            # and the carrier gets yanked toward wherever the plan points
+            # *this* turn, forever, without ever converging. "Empty tile
+            # nearest the shed" has no such instability -- at worst another
+            # unit claims it first, which just costs one extra turn to
+            # retarget, not indefinite wandering.)
+            build_op = "BUILD_COOP" if struct == "COOP" else "BUILD_PASTURE"
+            target = min(
+                all_empty_tiles,
+                key=lambda p: min(_manhattan(p, st) for st in shed_tiles),
+                default=None,
+            )
             if target is not None:
-                if pos == target:
-                    unit_actions[i] = [animal_build_targets[target][0]]
-                else:
-                    unit_actions[i] = [_step_towards(pos, target, board_size)]
+                unit_actions[i] = [build_op] if pos == target else [_step_towards(pos, target, board_size)]
             break
         if unit_actions[i] is not None:
             continue
@@ -441,13 +492,23 @@ def agent(obs):
     # tiers 2-4; light cargo is only dropped opportunistically in passing.
 
     def _cargo(inv):
-        return sum(v for k, v in inv.items() if k not in ANIMALS and k != "FERTILIZER")
+        # Animals stay excluded from the *threshold* count -- carrying just
+        # an animal shouldn't by itself trigger a cargo-return trip.
+        return sum(v for k, v in inv.items() if k not in ANIMALS)
+
+    def _carrying_animal(inv):
+        return any(inv.get(a, 0) > 0 for a in ANIMALS)
 
     def _do_drop(i, pos, inv):
+        # The real DROP action empties the *entire* inventory with no
+        # exception for animals -- so a unit currently carrying one must
+        # never reach here (checked by every call site below), or a fetched
+        # animal gets dumped straight back into the shed the moment it also
+        # picks up any ordinary cargo, undoing the fetch and re-triggering
+        # FETCH_ANIMAL next turn. Ask forever, get nothing: exactly the
+        # infinite fetch/drop loop this guard exists to prevent.
         unit_actions[i] = ["DROP"]
         for item, n in inv.items():
-            if item in ANIMALS or item == "FERTILIZER":
-                continue
             room = max(0, 100 - sum(projected_shed.values()))
             take = min(n, room)
             if take > 0:
@@ -458,6 +519,8 @@ def agent(obs):
             continue
         pos = tuple(units[i])
         inv = inventories[i] if i < len(inventories) else {}
+        if _carrying_animal(inv):
+            continue  # 2a already had first refusal on this unit; never DROP an animal
         cargo = _cargo(inv)
         if cargo >= CARGO_RETURN_THRESHOLD:
             if pos in shed_tile_set:
@@ -473,11 +536,22 @@ def agent(obs):
             continue
         pos = tuple(units[i])
         inv = inventories[i] if i < len(inventories) else {}
+        if _carrying_animal(inv):
+            continue
         cargo = _cargo(inv)
         if pos in shed_tile_set and cargo > 0:
             tile = _tile_at(tiles, pos, board_size)
             if not _has_local_urgent_task(tile, day):
                 _do_drop(i, pos, inv)
+
+    # (An "opportunistic wheat top-up" pass was tried here -- have any idle
+    # unit near the shed grab a couple wheat preemptively so it's ready to
+    # FEED whatever it's nearest to later. Measured net negative: it fires
+    # constantly (any day with a live animal), and the extra PICKUP turns it
+    # spends outweigh what it saves, since the FEED-requires-wheat check
+    # below already prevents the actual failure mode -- a wasted no-op
+    # action -- at zero cost by simply leaving the task for a unit that
+    # already happens to be carrying wheat.)
 
     # 2d. Tiered nearest-task assignment for everyone still free.
     for tier in (1, 2, 3, 4):
@@ -615,13 +689,14 @@ def _pick_diversified(ranked, counts, unlocked_tiles):
 
 
 def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
-                     market_inventory, unlocked_shops):
+                     market_inventory, unlocked_shops, shed):
     """Decide what goes on currently-empty tiles: returns (plant_targets, animal_build_targets),
     both {(x, y): value}, splitting the empty-tile pool between crops and new
     animal structures and respecting soft diversification caps."""
     empty = []
     crop_counts = {c: 0 for c in CROPS}
     animal_counts = {a: 0 for a in ANIMALS}
+    empty_structure_counts = {"COOP": 0, "PASTURE": 0}
     unlocked_tiles = 0
     for y in range(board_size):
         for x in range(board_size):
@@ -636,6 +711,8 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
                     crop_counts[tile["crop"]] = crop_counts.get(tile["crop"], 0) + 1
                 elif "animal" in tile:
                     animal_counts[tile["animal"]] = animal_counts.get(tile["animal"], 0) + 1
+                elif tile.get("kind") in empty_structure_counts:
+                    empty_structure_counts[tile["kind"]] += 1
 
     if not empty or unlocked_tiles == 0:
         return {}, {}
@@ -667,10 +744,30 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
     if animal_slots:
         ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops))
         reserve = 400
+        # Animals already bought and sitting in the shed are a sunk cost --
+        # housing them costs no more money and shouldn't be blocked by the
+        # affordability gate below, which exists only to avoid planning a
+        # site for a hypothetical *future* purchase we can't yet afford.
+        # Existing empty structures (cow/sheep share PASTURE, so claimed
+        # greedily in score order) cover some of them for free; only the
+        # remainder needs a genuinely new build site.
+        remaining_structures = dict(empty_structure_counts)
+        need_new_site = {}
+        for a in ranked_animals:
+            struct = ANIMALS[a]["structure"]
+            owned = shed.get(a, 0)
+            claim = min(owned, remaining_structures.get(struct, 0))
+            remaining_structures[struct] -= claim
+            need_new_site[a] = owned - claim
         for pos in animal_slots:
-            best = _pick_diversified(ranked_animals, animal_counts, unlocked_tiles)
-            if money - reserve < ANIMALS[best]["cost"]:
-                continue  # don't plan a build site we can't staff soon
+            pending = [a for a in ranked_animals if need_new_site.get(a, 0) > 0]
+            if pending:
+                best = _pick_diversified(pending, animal_counts, unlocked_tiles)
+                need_new_site[best] -= 1
+            else:
+                best = _pick_diversified(ranked_animals, animal_counts, unlocked_tiles)
+                if money - reserve < ANIMALS[best]["cost"]:
+                    continue  # don't plan a site for a purchase we can't afford yet
             struct = ANIMALS[best]["structure"]
             op = "BUILD_COOP" if struct == "COOP" else "BUILD_PASTURE"
             animal_build_targets[pos] = (op, best)  # (build op, which animal it's for)
@@ -703,9 +800,19 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
     sell_candidates = []
     wheat_reserve = FEED_RESERVE_PER_ANIMAL * max(n_animals_alive, 0)
     for item, qty in projected_shed.items():
-        if item == "FERTILIZER" or qty <= 0:
-            continue
-        sellable = qty - wheat_reserve if item == "WHEAT" else qty
+        if qty <= 0 or item in ANIMALS:
+            continue  # the shed dict holds animals too, but only PRODUCTS are sellable
+        # Fertilizer is a normal sellable PRODUCT like any other (it's often
+        # mis-documented as buy-only, but the actual rules never exclude it
+        # from SELL) -- and since it's a free byproduct of every fed animal,
+        # anything beyond a small working buffer is just money left on the
+        # table sitting in the shed.
+        if item == "WHEAT":
+            sellable = qty - wheat_reserve
+        elif item == "FERTILIZER":
+            sellable = qty - FERTILIZER_RESERVE
+        else:
+            sellable = qty
         if sellable <= 0:
             continue
         price = prices.get(item, BASE_PRICE.get(item, 1))
