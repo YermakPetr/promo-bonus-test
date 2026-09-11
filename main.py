@@ -8,21 +8,37 @@ animal or plant to neglect is the worst outcome), then harvest, then upkeep
 the bank it builds is what turns a cow's first milking into 6 units instead of 1;
 dig/collect fertilizer/deliver purchased animals & collected fertilizer), then
 expansion (plant/build coops&pastures) -- and greedily assign the farmer + every
-hired hand to the nearest unclaimed task each turn. Crop/animal choice for empty
-tiles is scored against current market price plus two forward-looking demand
-terms: permanent per-shop demand (a shop never closes once unlocked, so its
-demand is known the moment it opens, not just once price reacts to it) and, for
-the resources priced with a "hinge" scarcity curve (carrot/tomato/egg -- flat
-until inventory crosses a threshold below I0, then a hard spike), how far
-inventory already sits toward that threshold -- watching price alone catches the
-spike after it's under way, watching inventory catches the approach while still
-cheap to commit to. Soft per-type tile-share caps keep output diversified so we
-never dump everything into one glutted product, with an early-game bias toward
-fast-payback crops (wheat/carrot) so we aren't cash-starved while tomato/melon
-are still maturing. Land and hires are bought whenever the payoff clearly
-justifies the cost given days remaining. Selling is metered against a price
-floor except in the final days, when everything is liquidated since unsold
-inventory is worth nothing at game end.
+hired hand to the nearest unclaimed task each turn. Whenever a unit is *already
+standing* on a tile with a free action available, it takes that instead of
+whatever the general assignment would have sent it toward: this covers
+water/feed, care, and -- importantly -- planting or building right on a tile
+that was just harvested or weeded, so a unit never abandons a freshly-cleared
+zero-travel opportunity to go chase something else, only to leave that tile
+empty for however many turns until someone paths back through it. Building a
+coop/pasture is never done "blind" either: it only happens as the last step of
+a unit already carrying the animal (and a day's feed, picked up in the same
+shed stop) it's about to house, so there's never a separate return trip for
+the animal after the structure goes up. Crop/animal choice for empty tiles is
+scored against current market price plus two forward-looking demand terms:
+permanent per-shop demand (a shop never closes once unlocked, so its demand is
+known the moment it opens, not just once price reacts to it) and, for the
+resources priced with a "hinge" scarcity curve (carrot/tomato/egg -- flat until
+inventory crosses a threshold below I0, then a hard spike), how far inventory
+already sits toward that threshold -- watching price alone catches the spike
+after it's under way, watching inventory catches the approach while still cheap
+to commit to. Fertilizing is decided the same price-aware way: the marginal
+extra units it buys a given crop (wheat/carrot get some, melon never does,
+tomato/strawberry almost always do -- see FERTILIZE_MARGINAL_UNITS) are only
+worth applying when that many units at the crop's live price exceeds
+fertilizer's live price -- which, being buyable but never sellable and never
+consumed by the town, only ever rises from its $100 base, so this is a real
+comparison, not a fixed cutoff. Soft per-type tile-share caps keep output
+diversified so we never dump everything into one glutted product, with an
+early-game bias toward fast-payback crops (wheat/carrot) so we aren't
+cash-starved while tomato/melon are still maturing. Land and hires are bought
+whenever the payoff clearly justifies the cost given days remaining. Selling is
+metered against a price floor except in the final days, when everything is
+liquidated since unsold inventory is worth nothing at game end.
 
 Rules were taken from the installed kaggle_environments kaggriculture.py
 (v0.1.0), which differs in a few places from earlier drafts of the docs:
@@ -108,7 +124,36 @@ TILE_SHARE_CAP = {
     "GOOSE": 0.15, "COW": 0.10, "SHEEP": 0.08,
 }
 
-FERTILIZE_WORTHWHILE = {"TOMATO", "STRAWBERRY"}  # wheat/carrot/melon don't pay back the $100
+# Marginal extra units a single FERTILIZE application is worth, per crop --
+# derived from the actual watering-bonus-window / production-interval math
+# (see design notes), not guessed:
+#   one-time crops: fertilizing doubles the per-day bonus (1->2) for every day
+#     in the remaining bonus window (window_start..max_yield_day), capped by
+#     max_yield. wheat: 3 window days * 1 extra = 2 net after the cap (goes
+#     4->6); carrot: 2 window days -> capped at 4, net +1 (3->4); melon's
+#     7-day window already hits its cap (6) unfertilized, so +0 always --
+#     never worth it regardless of price.
+#   ongoing crops: one application covers a 3-day window, doubling yield
+#     (1->2) on every watered production day that falls in it. tomato
+#     (interval 1) gets 3 such days -> +3 units; strawberry (interval 2) gets
+#     2 -> +2 units.
+FERTILIZE_MARGINAL_UNITS = {
+    "WHEAT": 2, "CARROT": 1, "MELON": 0,
+    "TOMATO": 3, "STRAWBERRY": 2,
+}
+
+
+def _fertilize_worthwhile(crop, prices):
+    """Fertilizer only ever gets more expensive than its $100 base (it can be
+    bought but never sold, and neither the town center nor any shop consumes
+    it, so its market inventory only ever drains) -- so this has to compare
+    against the crop's OWN live price, not a fixed cutoff on fertilizer's."""
+    marginal = FERTILIZE_MARGINAL_UNITS.get(crop, 0)
+    if marginal <= 0:
+        return False
+    price = prices.get(crop, BASE_PRICE[crop])
+    fert_price = prices.get("FERTILIZER", BASE_PRICE["FERTILIZER"])
+    return marginal * price > fert_price
 
 BOOTSTRAP_CROPS = ("WHEAT", "CARROT")  # fast first_yield_day, keeps cash flowing early
 
@@ -242,10 +287,14 @@ def agent(obs):
         for x in range(board_size):
             tile = tiles[y][x]
             if tile is None:
+                # Note: a planned animal_build_targets site is deliberately NOT
+                # turned into a standalone tier-4 task here -- building a
+                # structure only makes sense together with an animal already
+                # in hand to put in it (see the carrying logic below), so
+                # building only ever happens as part of that fetch-and-place
+                # trip, never "blind" by whichever free unit is nearby.
                 if (x, y) in plant_targets:
                     tasks[4].append(("PLANT", (x, y), plant_targets[(x, y)]))
-                elif (x, y) in animal_build_targets:
-                    tasks[4].append((animal_build_targets[(x, y)], (x, y), None))
                 continue
             if tile == "LOCKED" or not isinstance(tile, dict):
                 continue
@@ -257,7 +306,7 @@ def agent(obs):
                     tasks[1].append(("WATER", (x, y), None))
                 if _plant_ready_to_harvest(tile, day):
                     tasks[2].append(("HARVEST", (x, y), None))
-                if tile["crop"] in FERTILIZE_WORTHWHILE and tile.get("fertilized_until_day", -1) < day + 1:
+                if tile.get("fertilized_until_day", -1) < day + 1 and _fertilize_worthwhile(tile["crop"], prices):
                     eligible_fertilize_targets.append((x, y))
             elif kind in ("COOP", "PASTURE"):
                 animal = tile.get("animal")
@@ -274,10 +323,16 @@ def agent(obs):
                     tasks[3].append(("COLLECT_FERTILIZER", (x, y), None))
 
     # Fetch tasks: shed has a purchased animal / leftover fertilizer waiting
-    # to be carried out. Target a shed-adjacent tile; PICKUP happens on arrival.
+    # to be carried out. Target a shed-adjacent tile; PICKUP happens on
+    # arrival, after which the carrying logic below walks it to an existing
+    # empty structure (immediate PLACE) or, if none exists, to one of the
+    # planned build sites for that same animal (build a home for it first).
     shed_tiles = _shed_access_tiles(board_size)
     for animal_name, data in ANIMALS.items():
-        need = min(shed.get(animal_name, 0), len(empty_structures[data["structure"]]))
+        homes_available = len(empty_structures[data["structure"]]) + sum(
+            1 for op, a in animal_build_targets.values() if a == animal_name
+        )
+        need = min(shed.get(animal_name, 0), homes_available)
         for k in range(need):
             tasks[3].append(("FETCH_ANIMAL", shed_tiles[k % 4], animal_name))
     if shed.get("FERTILIZER", 0) > 0 and eligible_fertilize_targets:
@@ -300,8 +355,17 @@ def agent(obs):
     # when standing on an already-fed animal: it's free, and skipping it costs
     # a whole day of banked bonus toward the animal's next payout (the bank is
     # what turns a fresh cow's first milking into 6 units instead of 1).
+    #
+    # PLANT/BUILD on a tile the unit is already standing on rides along too --
+    # HARVEST (one-time crops) and DIG both clear the tile to empty right
+    # under the unit's feet, and without this it would take its next move
+    # from the tiered pool below, which has no idea this exact tile is a
+    # zero-cost opportunity and might send it wandering off toward a farther
+    # task instead, leaving the freshly-cleared tile empty for however many
+    # turns until someone happens to path back through it.
     tier1_by_pos = {t[1]: t for t in tasks[1]}
     care_by_pos = {t[1]: t for t in tasks[3] if t[0] == "CARE"}
+    tier4_by_pos = {t[1]: t for t in tasks[4]}
     for i in range(n_units):
         pos = tuple(units[i])
         if pos in tier1_by_pos:
@@ -312,6 +376,12 @@ def agent(obs):
             op, tpos, extra = care_by_pos.pop(pos)
             tasks[3].remove((op, tpos, extra))
             unit_actions[i] = _finalize_tile_action(op, extra)
+        elif pos in tier4_by_pos:
+            op, tpos, extra = tier4_by_pos.pop(pos)
+            tasks[4].remove((op, tpos, extra))
+            unit_actions[i] = _finalize_tile_action(op, extra)
+
+    shed_tile_set = set(shed_tiles)
 
     # 2a. Units already carrying fertilizer / an animal act on that cargo first
     # (deliver-in-progress takes priority over starting something new).
@@ -322,7 +392,7 @@ def agent(obs):
 
         if inv.get("FERTILIZER", 0) > 0:
             if tile != "LOCKED" and isinstance(tile, dict) and tile.get("kind") == "PLANT" \
-               and tile["crop"] in FERTILIZE_WORTHWHILE and tile.get("fertilized_until_day", -1) < day + 1:
+               and tile.get("fertilized_until_day", -1) < day + 1 and _fertilize_worthwhile(tile["crop"], prices):
                 unit_actions[i] = ["FERTILIZE"]
                 continue
             target = _nearest(eligible_fertilize_targets, pos)
@@ -334,11 +404,31 @@ def agent(obs):
             if inv.get(animal_name, 0) <= 0:
                 continue
             struct = data["structure"]
+            # Standing on a ready structure: place immediately.
             if tile != "LOCKED" and isinstance(tile, dict) and tile.get("kind") == struct and "animal" not in tile:
                 unit_actions[i] = ["PLACE", animal_name]
-            else:
-                target = _nearest(empty_structures[struct], pos)
-                if target is not None:
+                break
+            # No feed yet and we're right at the shed: grab a day's wheat in
+            # the same stop as the animal, instead of a separate trip later
+            # just for that -- this is exactly the "take the animal AND a
+            # unit of feed together" sequencing.
+            if inv.get("WHEAT", 0) <= 0 and pos in shed_tile_set:
+                unit_actions[i] = ["PICKUP", "WHEAT", 1]
+                break
+            # Head for an existing empty structure of the right kind.
+            target = _nearest(empty_structures[struct], pos)
+            if target is not None:
+                unit_actions[i] = ["PLACE", animal_name] if pos == target else [_step_towards(pos, target, board_size)]
+                break
+            # No structure exists yet: go build one at the planned site for
+            # this animal (chosen back in _plan_expansion), rather than
+            # standing idle with a homeless animal on hand.
+            build_sites = [p for p, (op, a) in animal_build_targets.items() if a == animal_name]
+            target = _nearest(build_sites, pos)
+            if target is not None:
+                if pos == target:
+                    unit_actions[i] = [animal_build_targets[target][0]]
+                else:
                     unit_actions[i] = [_step_towards(pos, target, board_size)]
             break
         if unit_actions[i] is not None:
@@ -349,7 +439,6 @@ def agent(obs):
     # tasks are plentiful enough on an active farm that "return when idle"
     # never actually triggers. Heavy cargo gets a dedicated trip that preempts
     # tiers 2-4; light cargo is only dropped opportunistically in passing.
-    shed_tile_set = set(shed_tiles)
 
     def _cargo(inv):
         return sum(v for k, v in inv.items() if k not in ANIMALS and k != "FERTILIZER")
@@ -581,9 +670,10 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
         for pos in animal_slots:
             best = _pick_diversified(ranked_animals, animal_counts, unlocked_tiles)
             if money - reserve < ANIMALS[best]["cost"]:
-                continue  # don't pre-build structures we can't staff soon
+                continue  # don't plan a build site we can't staff soon
             struct = ANIMALS[best]["structure"]
-            animal_build_targets[pos] = "BUILD_COOP" if struct == "COOP" else "BUILD_PASTURE"
+            op = "BUILD_COOP" if struct == "COOP" else "BUILD_PASTURE"
+            animal_build_targets[pos] = (op, best)  # (build op, which animal it's for)
             animal_counts[best] = animal_counts.get(best, 0) + 1
 
     return plant_targets, animal_build_targets
@@ -705,25 +795,31 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
                 money -= n * cost_each
                 budget -= 1
 
-    # --- BUY_ANIMAL: only when we actually have (or are about to have) an
-    # empty matching structure waiting, so purchases don't idle in the shed
-    # (which would also eat into shedCapacity headroom). Also gated on an
-    # established wheat supply -- an animal placed before we can feed it
-    # daily starves and escapes within two days, losing the full purchase.
+    # --- BUY_ANIMAL: only when we actually have (or are about to have) a home
+    # for it -- either an existing empty structure or a build site planned
+    # specifically for this animal (see _plan_expansion) -- so a purchase
+    # never idles in the shed with nowhere to go (which would also eat into
+    # shedCapacity headroom). Also gated on an established wheat supply -- an
+    # animal placed before we can feed it daily starves and escapes within
+    # two days, losing the full purchase.
     wheat_established = projected_shed.get("WHEAT", 0) >= ANIMAL_WHEAT_GATE or day >= 6
     if budget > 0 and not wind_down and shed_total < 90 and wheat_established:
-        waiting = {
+        remaining_structures = {
             "COOP": len(empty_structures.get("COOP", [])),
             "PASTURE": len(empty_structures.get("PASTURE", [])),
         }
-        for op in animal_build_targets.values():
-            struct = "COOP" if op == "BUILD_COOP" else "PASTURE"
-            waiting[struct] = waiting.get(struct, 0) + 1
+        build_targets_for = {a: 0 for a in ANIMALS}
+        for op, a in animal_build_targets.values():
+            build_targets_for[a] += 1
         for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops)):
             if budget <= 0:
                 break
             struct = ANIMALS[animal]["structure"]
-            slots = waiting.get(struct, 0) - projected_shed.get(animal, 0)
+            # Cow and sheep both use PASTURE, so existing empty pastures are
+            # a shared pool -- whichever animal scores higher claims them
+            # first in this loop, the other only gets planned build sites.
+            homes = remaining_structures.get(struct, 0) + build_targets_for.get(animal, 0)
+            slots = homes - projected_shed.get(animal, 0)
             if slots <= 0:
                 continue
             cost = ANIMALS[animal]["cost"]
@@ -731,8 +827,11 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
             if money - reserve >= cost:
                 orders.append(["BUY_ANIMAL", animal, 1])
                 money -= cost
-                waiting[struct] -= 1
                 budget -= 1
+                if remaining_structures.get(struct, 0) > 0:
+                    remaining_structures[struct] -= 1
+                else:
+                    build_targets_for[animal] -= 1
 
     # --- BUY_PRODUCT WHEAT: emergency feed stopgap only, never the primary
     # source (growing wheat is far cheaper than buying it back).
