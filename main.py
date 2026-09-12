@@ -396,6 +396,42 @@ def _fertilize_worthwhile(crop, prices):
     fert_price = prices.get("FERTILIZER", BASE_PRICE["FERTILIZER"])
     return marginal * price > fert_price
 
+
+def _fertilize_window_open(tile, day):
+    """Whether FERTILIZE applied right now can still land inside the crop's
+    actual yield-bonus window, per the engine's own rule (_apply_action's
+    WATER handler): a one-time crop (wheat/carrot/melon) only earns the
+    fertilizer bonus during age in [window_start, max_yield_day] -- the same
+    window _plant_ready_to_harvest rides out before allowing harvest --
+    so fertilizing earlier is wasted (the 3-day coverage lapses before the
+    window opens) and fertilizing later covers fewer of the window's
+    remaining days than an on-time application would. Ongoing crops
+    (tomato/strawberry) have no such window: every production tick past
+    first_yield_day can take the bonus, so they're always open."""
+    cd = CROPS[tile["crop"]]
+    if cd["ongoing"]:
+        return True
+    age = day - tile["planted_day"]
+    window_start = (cd["max_yield_day"] + 1) // 2
+    return window_start <= age <= cd["max_yield_day"]
+
+
+def _needs_fertilize(tile, day, prices):
+    """The fertilize flag: up only while it can still buy real yield -- not
+    yet covering today+tomorrow, not already at the crop's hard yield cap,
+    inside the crop's actual bonus window (see _fertilize_window_open), and
+    worth the live price (see _fertilize_worthwhile). All four recomputed
+    fresh from tile state every turn, so this comes back up on its own once
+    a covering application lapses and stays down the moment one lands --
+    no separate stored flag to track."""
+    if tile.get("fertilized_until_day", -1) >= day + 1:
+        return False
+    if tile.get("yield_units", 0) >= CROPS[tile["crop"]]["max_yield"]:
+        return False
+    if not _fertilize_window_open(tile, day):
+        return False
+    return _fertilize_worthwhile(tile["crop"], prices)
+
 BOOTSTRAP_CROPS = ("WHEAT", "CARROT")  # fast first_yield_day, keeps cash flowing early
 
 LAND_ORDER = ["NE", "SW", "SE"]
@@ -584,7 +620,7 @@ def agent(obs, configuration=None):
                     tasks[1].append(("WATER", (x, y), None))
                 if _plant_ready_to_harvest(tile, day):
                     tasks[2].append(("HARVEST", (x, y), None))
-                if tile.get("fertilized_until_day", -1) < day + 1 and _fertilize_worthwhile(tile["crop"], prices):
+                if _needs_fertilize(tile, day, prices):
                     eligible_fertilize_targets.append((x, y))
             elif kind in ("COOP", "PASTURE"):
                 animal = tile.get("animal")
@@ -717,7 +753,7 @@ def agent(obs, configuration=None):
 
         if inv.get("FERTILIZER", 0) > 0:
             if tile != "LOCKED" and isinstance(tile, dict) and tile.get("kind") == "PLANT" \
-               and tile.get("fertilized_until_day", -1) < day + 1 and _fertilize_worthwhile(tile["crop"], prices):
+               and _needs_fertilize(tile, day, prices):
                 unit_actions[i] = ["FERTILIZE"]
                 continue
             target = _nearest(eligible_fertilize_targets, pos)
