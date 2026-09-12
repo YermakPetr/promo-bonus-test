@@ -194,6 +194,38 @@ def _consumption_per_day(item, unlocked_shops, cfg):
     return per_day
 
 
+# The engine unlocks one more shop slot every townShopUnlockInterval days (a
+# hardcoded cap, MAX_SHOP_INSTANCES below, not a configuration key), filling
+# each new slot with a uniform random draw (with replacement) from the 8 shop
+# types -- so WHICH type shows up next is random, but HOW MANY slots exist by
+# a given day is not. Verified against all 247 real replays used to derive
+# MARKET_PARAMS: n_shops(day) == min(8, day // townShopUnlockInterval) in
+# every single game, no exceptions, and at day 24 (all 8 slots full) every
+# shop type appears in ~1.0 of the 8 slots on average -- i.e. no type is
+# favored, confirming the "uniform draw" assumption below too.
+MAX_SHOP_INSTANCES = 8
+
+
+def _expected_shop_count(day, cfg):
+    """Expected number of unlocked shop slots by `day` (exact, not a guess --
+    see MAX_SHOP_INSTANCES above)."""
+    interval = max(1, cfg.get("townShopUnlockInterval", 3))
+    return min(MAX_SHOP_INSTANCES, max(0, day) // interval)
+
+
+def _avg_shop_consumption_per_slot(item, cfg):
+    """Expected extra daily draw on `item` from one additional shop slot,
+    averaged over the 8 shop types since a not-yet-unlocked slot could turn
+    out to be any of them (confirmed uniform empirically, see above)."""
+    turns_per_day = cfg.get("turnsPerDay", 24)
+    shop_ticks_per_day = turns_per_day / cfg.get("townShopSellInterval", 4)
+    total = 0.0
+    for products in SHOPS.values():
+        if item in products:
+            total += (2 if len(products) == 1 else 1) * shop_ticks_per_day
+    return total / len(SHOPS)
+
+
 def _standing_production_per_day(farms):
     """Combined daily output rate of each product from crops/animals already
     growing on *either* player's farm right now -- both farms' tiles are
@@ -215,74 +247,76 @@ def _standing_production_per_day(farms):
     return rate
 
 
-def _projected_price(item, days_ahead, market_inventory, unlocked_shops, standing_production, cfg):
+def _projected_price(item, days_ahead, day, market_inventory, unlocked_shops, standing_production, cfg):
     """Extrapolate `item`'s market inventory `days_ahead` days forward (net of
     the known consumption rate against both players' already-growing supply
     of it) and price *that*, instead of today's inventory -- a new planting
     sells around first_yield_day from now, not today, and by then a slow
     build-up already under way (or a deficit nobody is filling) can look very
-    different from the live price. Deliberately a straight-line projection
-    (ignores shops unlocking further or new plantings maturing in between) --
-    a full simulation would be more accurate but this is already exact where
-    it matters most: it uses the real price curve, not an approximated one."""
+    different from the live price. Consumption itself isn't frozen at today's
+    unlocked-shop count either: more shop slots reliably open on the way to a
+    distant horizon (see _expected_shop_count), and ignoring that used to make
+    the future look emptier -- and future oversupply scarier -- than it will
+    really be, which mattered most for slow-maturing products (milk/wool)
+    whose horizon is far enough out that several more slots are likely to
+    have opened by then. Shops ramp up gradually over the window rather than
+    all at once at the end, so this averages today's rate and the horizon's
+    rate rather than assuming the higher one holds for the whole span.
+    Deliberately still a straight-line supply projection (ignores new
+    plantings maturing in between) -- a full simulation would be more
+    accurate but this is already exact where it matters most: it uses the
+    real price curve, not an approximated one."""
     inv = market_inventory.get(item, MARKET_I0)
-    net_per_day = standing_production.get(item, 0.0) - _consumption_per_day(item, unlocked_shops, cfg)
+    current_rate = _consumption_per_day(item, unlocked_shops, cfg)
+    extra_slots = max(0.0, _expected_shop_count(day + days_ahead, cfg) - len(unlocked_shops))
+    horizon_rate = current_rate + extra_slots * _avg_shop_consumption_per_slot(item, cfg)
+    avg_consumption = (current_rate + horizon_rate) / 2.0
+    net_per_day = standing_production.get(item, 0.0) - avg_consumption
     return _market_price(item, inv + net_per_day * days_ahead)
 
 
 # Max sellable yield per tile per day at optimal (unfertilized) care -- matches
 # the README's own table; used to rank crop/animal ROI.
 #
-# TODO(cow/sheep yield): simulating _daily_refresh_animals directly confirms
-# the *steady-state* rate with daily feed+care+harvest is higher than what's
-# used below -- the very first payout is an outsized one-off (it banks
-# care/feed over the long first_yield_day ramp, far longer than the animal's
-# own production interval), but every payout after that only has `interval`
-# days to rebank, capping steady state well under the first-harvest number.
-# Confirmed: COW settles at 3 MILK every 2 days (1.5/day, not the 1.0 below)
-# and SHEEP at 4 WOOL every 3 days (1.33/day, not 0.67). Plugging those
-# corrected numbers in here measurably regressed several seeds' final
-# reward, though -- e.g. seed 1 vs starter: 6 COW + 2 SHEEP / $30,072 with
-# the numbers below, only 2 COW + 1 SHEEP / $27,498 with the "correct" ones.
-# Root cause isn't capacity (disabling the new CAPACITY_MARGIN gate entirely
-# changes nothing) -- it's that a higher YIELD_PER_TILE_DAY also raises
-# standing_production's assumed per-animal output (see
-# _standing_production_per_day), which _projected_price reads as *this much
-# more* future oversupply from cows already out there, so _animal_score
-# turns more conservative sooner than it should and the bot ends up buying
-# fewer animals overall, even though each individual one is now scored more
-# accurately. The fix likely belongs in how the projection weighs "my own
-# future supply discourages more of the same" against "grabbing share before
-# the opponent does still nets more total revenue," not in this constant --
-# left at the old (undervaluing) numbers until that's sorted out, since they
-# measurably outperform the correct ones under the current projection.
+# COW/SHEEP: simulating _daily_refresh_animals directly confirms the
+# *steady-state* rate with daily feed+care+harvest is higher than a naive
+# max_held/first_yield_day figure would suggest -- the very first payout is
+# an outsized one-off (it banks care/feed over the long first_yield_day
+# ramp, far longer than the animal's own production interval), but every
+# payout after that only has `interval` days to rebank. Confirmed: COW
+# settles at 3 MILK every 2 days (1.5/day) and SHEEP at 4 WOOL every 3 days
+# (1.33/day). This is the honest steady-state number and is applied below --
+# see _projected_price for the demand-side counterpart it needed (shop
+# slots expected to unlock before a product's horizon) so a higher
+# standing_production assumption here doesn't read as more future
+# oversupply than is real, which is what a first pass at this found (COW's
+# _animal_score roughly doubled once both changes went in, seed 2 vs_starter
+# e.g. 199.7 -> 334.2 at day 8).
 #
-# Tried once already: widen _consumption_per_day's projection to account for
-# shop slots expected to unlock between now and each product's horizon
-# (shops unlock deterministically in COUNT -- min(8, day // interval),
-# verified exactly against all 247 real replays -- even though WHICH of the 8
-# types fills each slot is random), on the theory that _projected_price was
-# freezing consumption at today's shop count and so understating future
-# demand, making future oversupply look scarier than it really is. Confirmed
-# via the same 247 replays that "8 shop slots is enough to have unlocked
-# every type in expectation" holds, so the projection is fine per se -- but
-# plugging it into _projected_price for ALL products (not just cows/sheep)
-# and re-testing the corrected 1.5/1.333 numbers on top of it still net
-# REGRESSED the 10-seed vs_starter average (~31,326 vs ~31,883 baseline,
-# 6/10 seeds worse) and, tellingly, changing COW/SHEEP's yield constant made
-# *zero* difference to the final tile allocation once this wider projection
-# was in place (some other factor -- likely TILE_SHARE_CAP or the capacity
-# gate -- became the binding constraint before the yield-driven score gap
-# could change the pick order). So the earlier diagnosis (this constant
-# feeding _standing_production_per_day makes _animal_score too conservative)
-# was real but this particular counter-lever doesn't reach it; reverted.
-# Next angle to try: separate the number used to value a single animal's OWN
-# future revenue from the number used to project the *combined* market's
-# future supply -- i.e. two constants instead of one, rather than trying to
-# fix it by inflating the demand side further.
+# On the 10-seed vs_starter sweep this combination still nets slightly
+# behind the old undervaluing 1.0/0.67 numbers (~31,326 vs ~31,883, 6/10
+# seeds worse) despite scoring cows/sheep far more favorably -- traced this
+# (seed 2) to a *different* bottleneck than the score itself: buying a new
+# COW/SHEEP is throttled by max_concurrent_animal_errands = max(1, n_units
+# // 4) (see its definition), which caps how many bought-but-not-yet-placed
+# animals can sit in the shed waiting for a free hand to fetch+place them --
+# with only 1-2 units early on that's a cap of 1, so a higher animal score
+# doesn't speed up *actual* herd growth at all once that fetch pipeline is
+# the binding constraint, while the same wider demand projection also raised
+# STRAWBERRY/TOMATO's score, pulling more of the same scarce hand-time into
+# planting/watering more of those instead of fetching animals sooner. So the
+# yield number and its demand-side fix are both honest and correctly wired;
+# the actual lever still to pull is on the labor-allocation side (make
+# fetch+place errands win a bigger share of hand-time when the animal
+# they're for is scored this much higher, or grow max_concurrent_animal_
+# errands / hiring faster in response) -- not this constant. Kept as the
+# factually correct number regardless, per-sandbox-seed totals being a
+# small, non-representative sample next to real game conditions, and this
+# groundwork (real yield + real demand projection) is what the labor-side
+# fix needs to build on once that's tackled.
 YIELD_PER_TILE_DAY = {
     "WHEAT": 1.5, "CARROT": 1.333, "TOMATO": 4.0, "STRAWBERRY": 2.0, "MELON": 0.5,
-    "GOOSE": 2.0, "COW": 1.0, "SHEEP": 0.67,
+    "GOOSE": 2.0, "COW": 1.5, "SHEEP": 1.333,
 }
 
 # Recurring daily task-action cost of keeping one tile of this type running,
@@ -952,17 +986,17 @@ def _finalize_tile_action(op, extra):
 # Economics: what to plant / build next
 # ---------------------------------------------------------------------------
 
-def _crop_score(crop, market_inventory, unlocked_shops, standing_production, cfg):
+def _crop_score(crop, day, market_inventory, unlocked_shops, standing_production, cfg):
     price = _projected_price(
-        crop, CROPS[crop]["first_yield_day"], market_inventory, unlocked_shops, standing_production, cfg,
+        crop, CROPS[crop]["first_yield_day"], day, market_inventory, unlocked_shops, standing_production, cfg,
     )
     return YIELD_PER_TILE_DAY[crop] * price - AMORTIZED_COST_PER_DAY[crop]
 
 
-def _animal_score(animal, prices, market_inventory, unlocked_shops, standing_production, cfg):
+def _animal_score(animal, day, prices, market_inventory, unlocked_shops, standing_production, cfg):
     product = ANIMAL_PRODUCT[animal]
     price = _projected_price(
-        product, ANIMALS[animal]["first_yield_day"], market_inventory, unlocked_shops, standing_production, cfg,
+        product, ANIMALS[animal]["first_yield_day"], day, market_inventory, unlocked_shops, standing_production, cfg,
     )
     feed_cost_per_day = prices.get("WHEAT", BASE_PRICE["WHEAT"])  # ~1 wheat/day/animal, paid now
     return YIELD_PER_TILE_DAY[animal] * price - AMORTIZED_COST_PER_DAY[animal] - feed_cost_per_day
@@ -1033,7 +1067,7 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
     shed_tiles = _shed_access_tiles(board_size)
     empty.sort(key=lambda p: min(_manhattan(p, st) for st in shed_tiles))
 
-    ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops, standing_production, cfg))
+    ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, day, prices, market_inventory, unlocked_shops, standing_production, cfg))
     # Animals already bought and sitting in the shed are a sunk cost -- housing
     # them costs no more money and shouldn't be blocked by the affordability
     # gate below, which exists only to avoid planning a site for a
@@ -1105,7 +1139,7 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
     if not wind_down or remaining_days >= 4:
         ranked_crops = sorted(
             (c for c in CROPS if seeds.get(c, 0) > 0 and (not wind_down or remaining_days >= CROPS[c]["max_yield_day"] + 2)),
-            key=lambda c: -_crop_score(c, market_inventory, unlocked_shops, standing_production, cfg),
+            key=lambda c: -_crop_score(c, day, market_inventory, unlocked_shops, standing_production, cfg),
         )
         if ranked_crops:
             for pos in crop_slots:
@@ -1275,7 +1309,7 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
         # own (diversifying has real value, and each purchase is scored on
         # its own projected merit, which already prices in how much of it is
         # already committed), just worth knowing it's not "pick one."
-        for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops, standing_production, cfg)):
+        for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, day, prices, market_inventory, unlocked_shops, standing_production, cfg)):
             if budget <= 0:
                 break
             struct = ANIMALS[animal]["structure"]
@@ -1340,7 +1374,7 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
     if budget > 0 and not wind_down:
         def seed_key(c):
             is_fast = c in BOOTSTRAP_CROPS
-            return (0 if (bootstrapping and is_fast) else 1, -_crop_score(c, market_inventory, unlocked_shops, standing_production, cfg))
+            return (0 if (bootstrapping and is_fast) else 1, -_crop_score(c, day, market_inventory, unlocked_shops, standing_production, cfg))
 
         for crop in sorted(CROPS, key=seed_key):
             if budget <= 0:
