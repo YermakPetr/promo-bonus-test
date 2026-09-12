@@ -1070,20 +1070,31 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
         #    the estimate is "how much will price actually move" rather than
         #    just "more existing supply is worse."
         #  - Not implemented: project town consumption forward instead of
-        #    only looking at current price/inventory -- verified against the
-        #    installed engine (kaggriculture.py _town_consume): each shop
-        #    instance consumes its listed products every townShopSellInterval
-        #    steps (default 4, not 12), and the town center consumes 1 of
-        #    every non-fertilizer product every townCenterSellInterval steps
-        #    (default 24 = 1 day) -- flat rates, no day-10/20 consumption
-        #    ramp exists in this version (that part of the idea doesn't hold
-        #    up against the actual code, so don't encode it). What *is*
-        #    real and not yet modeled: which shops are unlocked now (checked
-        #    every 3 days -- townShopUnlockInterval, default 3 -- capped at
-        #    MAX_SHOP_INSTANCES=8, drawn randomly with replacement) sets a
-        #    known, deterministic near-term consumption floor per product
-        #    that a smarter score could project forward a few days instead
-        #    of only reading unlocked_shops as of right now.
+        #    only looking at current price/inventory. Rates are flat all
+        #    season either way (no day-10/20 ramp) and shops unlock every
+        #    townShopUnlockInterval days (default 3, capped at 8 instances,
+        #    drawn with replacement) -- both confirmed consistently by the
+        #    installed package's code, its JSON config schema, and its own
+        #    shipped README all at once. But the *tick interval* numbers
+        #    disagree with an outside rules doc we were shown (that doc:
+        #    townCenterSellInterval 12; this installed package: 24 -- same
+        #    three internal sources agreeing with each other, just not with
+        #    that external doc). Rather than trust either number, note that
+        #    the harness actually offers a way to sidestep guessing
+        #    entirely: kaggle_environments calls an agent with a second
+        #    `configuration` argument if the function accepts one (it
+        #    truncates args to the function's declared arg count -- see
+        #    kaggle_environments/agent.py, `co_argcount`), carrying the
+        #    *real* interval values for whatever environment instance is
+        #    actually running, ours or the real competition's. `agent(obs)`
+        #    here only takes one argument and so never sees it. Whenever this
+        #    projection is actually built, take `configuration` as a second
+        #    argument and read the intervals from it (falling back to these
+        #    documented defaults only if a key is absent) instead of
+        #    hardcoding either source's number -- that's correct regardless
+        #    of which doc turns out to describe the grading environment.
+        #    Shop-unlock cadence and the 8-instance cap were not part of the
+        #    disagreement and can be taken as given.
         for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops, animals_in_play)):
             if budget <= 0:
                 break
