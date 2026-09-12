@@ -17,8 +17,19 @@ zero-travel opportunity to go chase something else, only to leave that tile
 empty for however many turns until someone paths back through it. Building a
 coop/pasture is never done "blind" either: it only happens as the last step of
 a unit already carrying the animal (and a day's feed, picked up in the same
-shed stop) it's about to house, so there's never a separate return trip for
-the animal after the structure goes up. Crop/animal choice for empty tiles is
+shed stop, when the shed has any) it's about to house, so there's never a
+separate return trip for the animal after the structure goes up. Only a
+small, workforce-scaled number of these fetch errands run at once (each one
+occupies a unit for its full multi-turn length, unavailable for watering
+duty until it completes), keeping most hands on watering even while animals
+are being onboarded. Once placed, a further daily task sends a unit to draw
+a day's wheat from the shed specifically to feed whichever animal needs it
+-- FEED consumes wheat from the acting unit's own inventory, not the shed
+directly, and missing two consecutive days loses the animal for good.
+Buying new animals is capped to a small unfetched-backlog per type: the
+build-site planner is willing to speculate on many more homes than the
+fetch pipeline can actually process per turn, and buying up to that larger
+number just parks money as dead capital sitting in the shed. Crop/animal choice for empty tiles is
 scored against current market price plus two forward-looking demand terms:
 permanent per-shop demand (a shop never closes once unlocked, so its demand is
 known the moment it opens, not just once price reacts to it) and, for the
@@ -262,35 +273,31 @@ def agent(obs):
     endgame = day >= LIQUIDATE_DAY
     wind_down = day >= WIND_DOWN_DAY
 
-    # Only "alive" (placed) animals count toward the wheat reserve. Counting
-    # shed-held/carried ones too was tried, reasoning that a freshly-fetched
-    # animal needs a day's feed before it can depart -- but most bought
-    # animals sit in the shed unfetched for a long time (FETCH_ANIMAL is a
-    # low-priority tier-3 task, not guaranteed to run soon), so that reserve
-    # just locked up wheat behind a fetch that mostly never happens,
-    # measurably worse than the rarer case it was guarding against.
+    # Only "alive" (placed) animals count toward the wheat reserve. A newly
+    # bought animal graduates into this count the same turn it's placed (its
+    # own fetch errand grabs its first day's wheat directly, see 2a below),
+    # so sizing the reserve off shed-held/pending ones too isn't needed and
+    # measured worse when tried -- it locked up wheat ahead of animals that
+    # weren't reliably getting fetched soon.
     n_animals_alive = sum(
         1 for row in tiles for t in row if isinstance(t, dict) and "animal" in t
     )
 
     # ------------------------------------------------------------------
     # 1. Build the prioritized task list from farm tiles (one grid pass).
-    #    tier 1: FEED / WATER (critical -- must happen today)
-    #    tier 2: HARVEST (ready produce)
-    #    tier 3: CARE / DIG / COLLECT_FERTILIZER / fetch a purchased animal
-    #            or leftover shed fertilizer
-    #    tier 4: PLANT / BUILD_COOP / BUILD_PASTURE (expansion)
-    #
-    # (FETCH_ANIMAL was tried at a dedicated tier above HARVEST, reasoning
-    # that a sunk-cost animal sitting unfetched is worse than a slightly late
-    # harvest. Measured worse in practice: pulling multiple units into
-    # animal logistics every time one is bought destabilized the rest of the
-    # farm's routine -- feeding fell behind and animals escaped in waves --
-    # for a net loss even accounting for the animals it did get placed. Left
-    # here at tier 3, most purchased animals just sit in the shed unfetched,
-    # which sounds worse but empirically outperforms actively chasing them.)
+    #    tier 1:   FEED / WATER (critical -- must happen today)
+    #    tier 1.5: fetch a purchased animal waiting in the shed. A sunk-cost
+    #              animal (already paid $300-500) earning nothing every turn
+    #              it sits unfetched is worse than a slightly late harvest.
+    #              Concurrency is capped (see fetch_slots below) since each
+    #              fetch occupies a unit for its full multi-turn errand,
+    #              unavailable for tier-1 watering until it completes.
+    #    tier 2:   HARVEST (ready produce)
+    #    tier 3:   CARE / DIG / COLLECT_FERTILIZER / fetch leftover shed
+    #              fertilizer
+    #    tier 4:   PLANT / BUILD_COOP / BUILD_PASTURE (expansion)
     # ------------------------------------------------------------------
-    tasks = {1: [], 2: [], 3: [], 4: []}
+    tasks = {1: [], 1.5: [], 2: [], 3: [], 4: []}
 
     plant_targets, animal_build_targets = _plan_expansion(
         tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
@@ -355,15 +362,46 @@ def agent(obs):
     # empty structure (immediate PLACE) or, if none exists, to one of the
     # planned build sites for that same animal (build a home for it first).
     shed_tiles = _shed_access_tiles(board_size)
+    # Cap how many units can be mid-errand (fetch -> build -> place -> feed)
+    # at once: once carrying, a unit is captured by the 2a logic below for the
+    # errand's full multi-turn length and unavailable for tier-1 WATER, no
+    # matter how many WATER tasks are outstanding that turn. Dispatching every
+    # eligible animal at once (one fetcher per animal type, every turn there's
+    # room) can tie up enough of the workforce simultaneously to let watering
+    # fall behind and weeds run away -- this is what caused the very first
+    # tier-1.5 regression. Keeping the sequencing itself (per explicit
+    # instruction) but throttling concurrency to a small, workforce-scaled
+    # number keeps most units on watering duty while animals still get fetched
+    # steadily, just not all in the same turn.
+    n_units_carrying_animal = sum(
+        1 for inv in inventories if any(inv.get(a, 0) > 0 for a in ANIMALS)
+    )
+    fetch_slots = max(0, max(1, n_units // 4) - n_units_carrying_animal)
     for animal_name, data in ANIMALS.items():
+        if fetch_slots <= 0:
+            break
         homes_available = len(empty_structures[data["structure"]]) + sum(
             1 for op, a in animal_build_targets.values() if a == animal_name
         )
-        need = min(shed.get(animal_name, 0), homes_available)
+        need = min(shed.get(animal_name, 0), homes_available, fetch_slots)
         for k in range(need):
-            tasks[3].append(("FETCH_ANIMAL", shed_tiles[k % 4], animal_name))
+            tasks[1.5].append(("FETCH_ANIMAL", shed_tiles[k % 4], animal_name))
+        fetch_slots -= need
     if shed.get("FERTILIZER", 0) > 0 and eligible_fertilize_targets:
         tasks[3].append(("FETCH_FERTILIZER", shed_tiles[0], "FERTILIZER"))
+
+    # A placed animal still needs a *daily* FEED after the one-time fetch
+    # errand above delivers its first day's wheat -- and FEED consumes wheat
+    # from the acting unit's own inventory, so someone has to actually be
+    # holding wheat when they reach it. Nothing else in the task list sends a
+    # unit to the shed just to stock up for that; without it, feeding only
+    # ever happens by the accident of some unit already carrying wheat for an
+    # unrelated reason (e.g. just harvested it) passing near a hungry animal,
+    # and two consecutive misses make it escape for good. Send exactly one
+    # fetcher, only when nobody is already carrying wheat to deliver.
+    if shed.get("WHEAT", 0) > 0 and any(t[0] == "FEED" for t in tasks[1]) and \
+       not any(inv.get("WHEAT", 0) > 0 for inv in inventories):
+        tasks[1].append(("FETCH_WHEAT_FOR_FEED", shed_tiles[0], "WHEAT"))
 
     # ------------------------------------------------------------------
     # 2. Assign actions unit by unit.
@@ -419,6 +457,7 @@ def agent(obs):
 
     # 2a. Units already carrying fertilizer / an animal act on that cargo first
     # (deliver-in-progress takes priority over starting something new).
+    feed_targets = [t[1] for t in tasks[1] if t[0] == "FEED"]
     for i in range(n_units):
         pos = tuple(units[i])
         inv = inventories[i] if i < len(inventories) else {}
@@ -445,8 +484,15 @@ def agent(obs):
             # No feed yet and we're right at the shed: grab a day's wheat in
             # the same stop as the animal, instead of a separate trip later
             # just for that -- this is exactly the "take the animal AND a
-            # unit of feed together" sequencing.
-            if inv.get("WHEAT", 0) <= 0 and pos in shed_tile_set:
+            # unit of feed together" sequencing. Only when the shed actually
+            # *has* wheat right now, though: PICKUP silently no-ops on an
+            # empty shed stock (nothing to give), so requesting it anyway
+            # would re-issue the same no-op forever and strand the unit here
+            # permanently -- never placing the animal, never freed for
+            # watering. If there's none to grab yet, carry on toward the
+            # structure and let a later FEED task (once placed) pick up wheat
+            # when the shed actually has some.
+            if inv.get("WHEAT", 0) <= 0 and pos in shed_tile_set and shed.get("WHEAT", 0) > 0:
                 unit_actions[i] = ["PICKUP", "WHEAT", 1]
                 break
             # Head for an existing empty structure of the right kind.
@@ -484,6 +530,22 @@ def agent(obs):
             break
         if unit_actions[i] is not None:
             continue
+
+        # Already holding wheat (for whatever reason -- just harvested it, or
+        # fetched it earlier and never used it) with a hungry animal waiting
+        # somewhere: deliver it now rather than leaving the match to chance in
+        # the general tier-1 pass below, which only pairs a wheat-carrier with
+        # a FEED task when that unit happens to still be free and nearest.
+        # Missing this is not a small loss -- two consecutive unfed days and
+        # the animal is gone for good.
+        if inv.get("WHEAT", 0) > 0 and feed_targets:
+            if tile != "LOCKED" and isinstance(tile, dict) and "animal" in tile and not tile["fed_today"]:
+                unit_actions[i] = ["FEED"]
+                continue
+            target = _nearest(feed_targets, pos)
+            if target is not None:
+                unit_actions[i] = [_step_towards(pos, target, board_size)]
+                continue
 
     # 2b. Cargo management: a unit sitting on a meaningful harvest should bank
     # it rather than wander off chasing the next-nearest task indefinitely --
@@ -554,12 +616,10 @@ def agent(obs):
     # already happens to be carrying wheat.)
 
     # 2d. Tiered nearest-task assignment for everyone still free.
-    for tier in (1, 2, 3, 4):
-        pool = tasks[tier]
-        free_units = [i for i in range(n_units) if unit_actions[i] is None]
-        for i in free_units:
-            if not pool:
-                break
+    def _assign_nearest(pool, candidates):
+        for i in candidates:
+            if unit_actions[i] is not None or not pool:
+                continue
             pos = tuple(units[i])
             best_idx = min(range(len(pool)), key=lambda k: _manhattan(pos, pool[k][1]))
             op, tpos, extra = pool.pop(best_idx)
@@ -567,6 +627,37 @@ def agent(obs):
                 unit_actions[i] = _finalize_tile_action(op, extra)
             else:
                 unit_actions[i] = [_step_towards(pos, tpos, board_size)]
+
+    for tier in (1, 1.5, 2, 3, 4):
+        pool = tasks[tier]
+        if tier == 1:
+            # FEED consumes WHEAT from the *acting unit's own* inventory, never
+            # the shed -- dispatching it to a unit with none isn't just wasted
+            # travel, it's a guaranteed no-op that still burns the task for the
+            # turn, and two consecutive missed days make the animal escape for
+            # good. WATER has no such requirement and goes to any free unit;
+            # FEED is restricted to units already carrying wheat, so a task
+            # that can't currently be completed is left for next turn instead
+            # of being wasted on a unit that can't pay for it.
+            water_pool = [t for t in pool if t[0] == "WATER"]
+            feed_pool = [t for t in pool if t[0] == "FEED"]
+            # Anything else here is FETCH_WHEAT_FOR_FEED, which needs no
+            # wheat in hand (that's the point of it) and so goes to any free
+            # unit, same as WATER.
+            other_pool = [t for t in pool if t[0] not in ("WATER", "FEED")]
+            free_units = [i for i in range(n_units) if unit_actions[i] is None]
+            _assign_nearest(water_pool, free_units)
+            free_units = [i for i in range(n_units) if unit_actions[i] is None]
+            wheat_units = [
+                i for i in free_units
+                if (inventories[i] if i < len(inventories) else {}).get("WHEAT", 0) > 0
+            ]
+            _assign_nearest(feed_pool, wheat_units)
+            free_units = [i for i in range(n_units) if unit_actions[i] is None]
+            _assign_nearest(other_pool, free_units)
+            continue
+        free_units = [i for i in range(n_units) if unit_actions[i] is None]
+        _assign_nearest(pool, free_units)
 
     # 2e. Anyone still idle (no tasks anywhere): any leftover cargo at all ->
     # head to shed; otherwise hold position.
@@ -631,7 +722,7 @@ def _has_local_urgent_task(tile, day):
 def _finalize_tile_action(op, extra):
     if op == "PLANT":
         return ["PLANT", extra]
-    if op in ("FETCH_ANIMAL", "FETCH_FERTILIZER"):
+    if op in ("FETCH_ANIMAL", "FETCH_FERTILIZER", "FETCH_WHEAT_FOR_FEED"):
         return ["PICKUP", extra, 1]
     return [op]
 
@@ -928,6 +1019,15 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
             homes = remaining_structures.get(struct, 0) + build_targets_for.get(animal, 0)
             slots = homes - projected_shed.get(animal, 0)
             if slots <= 0:
+                continue
+            # "homes" counts every planned build site the expansion planner is
+            # willing to speculate on, which can be many more than the fetch
+            # pipeline actually processes per turn (throttled on purpose, see
+            # fetch_slots above, to keep most of the workforce on watering).
+            # Buying up to that generous limit just parks money as dead
+            # capital sitting unfetched in the shed for a long time -- cap the
+            # unfetched backlog small so purchases track actual throughput.
+            if projected_shed.get(animal, 0) >= 2:
                 continue
             cost = ANIMALS[animal]["cost"]
             reserve = 400
