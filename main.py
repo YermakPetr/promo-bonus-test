@@ -283,6 +283,13 @@ def agent(obs):
         1 for row in tiles for t in row if isinstance(t, dict) and "animal" in t
     )
 
+    # Same workforce-scaled number paces how many near-shed tiles get
+    # reserved for animals (_plan_expansion), how many unfetched animals of
+    # one type BUY_ANIMAL is willing to stockpile, and how many fetch errands
+    # run at once below -- there's no point planning, owning, or chasing more
+    # than we can actually work through concurrently.
+    max_concurrent_animal_errands = max(1, n_units // 4)
+
     # ------------------------------------------------------------------
     # 1. Build the prioritized task list from farm tiles (one grid pass).
     #    tier 1:   FEED / WATER (critical -- must happen today)
@@ -301,7 +308,7 @@ def agent(obs):
 
     plant_targets, animal_build_targets = _plan_expansion(
         tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
-        market_inventory, unlocked_shops, shed,
+        market_inventory, unlocked_shops, shed, max_concurrent_animal_errands,
     )
 
     empty_structures = {"COOP": [], "PASTURE": []}
@@ -376,12 +383,6 @@ def agent(obs):
     n_units_carrying_animal = sum(
         1 for inv in inventories if any(inv.get(a, 0) > 0 for a in ANIMALS)
     )
-    # Same workforce-scaled number gates both how many fetch errands run at
-    # once here and how many unfetched animals of one type BUY_ANIMAL is
-    # willing to stockpile in the shed below -- there is no point owning more
-    # than we can be actively fetching, that's just money parked as dead
-    # capital waiting its turn.
-    max_concurrent_animal_errands = max(1, n_units // 4)
     fetch_slots = max(0, max_concurrent_animal_errands - n_units_carrying_animal)
     for animal_name, data in ANIMALS.items():
         if fetch_slots <= 0:
@@ -787,7 +788,7 @@ def _pick_diversified(ranked, counts, unlocked_tiles):
 
 
 def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
-                     market_inventory, unlocked_shops, shed):
+                     market_inventory, unlocked_shops, shed, max_concurrent_animal_errands):
     """Decide what goes on currently-empty tiles: returns (plant_targets, animal_build_targets),
     both {(x, y): value}, splitting the empty-tile pool between crops and new
     animal structures and respecting soft diversification caps."""
@@ -821,10 +822,41 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
     shed_tiles = _shed_access_tiles(board_size)
     empty.sort(key=lambda p: min(_manhattan(p, st) for st in shed_tiles))
 
-    crop_fraction = 0.8 if day < BOOTSTRAP_DAY else 0.6
-    n_crop_slots = max(1, int(len(empty) * crop_fraction)) if not wind_down else len(empty)
-    crop_slots = empty[:n_crop_slots]
-    animal_slots = [] if wind_down else empty[n_crop_slots:]
+    ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops))
+    # Animals already bought and sitting in the shed are a sunk cost -- housing
+    # them costs no more money and shouldn't be blocked by the affordability
+    # gate below, which exists only to avoid planning a site for a
+    # hypothetical *future* purchase we can't yet afford. Existing empty
+    # structures (cow/sheep share PASTURE, so claimed greedily in score order)
+    # cover some of them for free; only the remainder needs a genuinely new
+    # build site.
+    remaining_structures = dict(empty_structure_counts)
+    need_new_site = {}
+    for a in ranked_animals:
+        struct = ANIMALS[a]["structure"]
+        owned = shed.get(a, 0)
+        claim = min(owned, remaining_structures.get(struct, 0))
+        remaining_structures[struct] -= claim
+        need_new_site[a] = owned - claim
+
+    # Animals cost a recurring shed round-trip every day (feed, plus the
+    # fetch/build/place errand itself) that crops never do, so -- unlike
+    # crops -- they get first claim on the tiles nearest the shed. Only as
+    # many of those near tiles as there's real use for, though: every animal
+    # already owned needs a site (guaranteed), plus a small speculative
+    # buffer for ones affordable soon, paced by the same concurrency number
+    # that throttles the fetch errand itself -- never a fixed fraction of all
+    # empty land regardless of actual need, which just parks near-shed tiles
+    # under a "maybe" indefinitely.
+    cheapest_animal_cost = min(a["cost"] for a in ANIMALS.values())
+    can_afford_more_soon = money - 400 >= cheapest_animal_cost
+    speculative = max_concurrent_animal_errands if (not wind_down and can_afford_more_soon) else 0
+    owned_needing_site = sum(need_new_site.values())
+    if wind_down:
+        animal_slots, crop_slots = [], empty
+    else:
+        n_animal_slots = min(len(empty), owned_needing_site + speculative)
+        animal_slots, crop_slots = empty[:n_animal_slots], empty[n_animal_slots:]
 
     plant_targets = {}
     if not wind_down or remaining_days >= 4:
@@ -840,23 +872,7 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
 
     animal_build_targets = {}
     if animal_slots:
-        ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops))
         reserve = 400
-        # Animals already bought and sitting in the shed are a sunk cost --
-        # housing them costs no more money and shouldn't be blocked by the
-        # affordability gate below, which exists only to avoid planning a
-        # site for a hypothetical *future* purchase we can't yet afford.
-        # Existing empty structures (cow/sheep share PASTURE, so claimed
-        # greedily in score order) cover some of them for free; only the
-        # remainder needs a genuinely new build site.
-        remaining_structures = dict(empty_structure_counts)
-        need_new_site = {}
-        for a in ranked_animals:
-            struct = ANIMALS[a]["structure"]
-            owned = shed.get(a, 0)
-            claim = min(owned, remaining_structures.get(struct, 0))
-            remaining_structures[struct] -= claim
-            need_new_site[a] = owned - claim
         for pos in animal_slots:
             pending = [a for a in ranked_animals if need_new_site.get(a, 0) > 0]
             if pending:
