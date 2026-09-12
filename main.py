@@ -376,7 +376,13 @@ def agent(obs):
     n_units_carrying_animal = sum(
         1 for inv in inventories if any(inv.get(a, 0) > 0 for a in ANIMALS)
     )
-    fetch_slots = max(0, max(1, n_units // 4) - n_units_carrying_animal)
+    # Same workforce-scaled number gates both how many fetch errands run at
+    # once here and how many unfetched animals of one type BUY_ANIMAL is
+    # willing to stockpile in the shed below -- there is no point owning more
+    # than we can be actively fetching, that's just money parked as dead
+    # capital waiting its turn.
+    max_concurrent_animal_errands = max(1, n_units // 4)
+    fetch_slots = max(0, max_concurrent_animal_errands - n_units_carrying_animal)
     for animal_name, data in ANIMALS.items():
         if fetch_slots <= 0:
             break
@@ -684,6 +690,7 @@ def agent(obs):
         endgame=endgame, wind_down=wind_down, remaining_days=remaining_days,
         animal_build_targets=animal_build_targets, empty_structures=empty_structures,
         tiles=tiles, board_size=board_size, unlocked_shops=unlocked_shops,
+        max_concurrent_animal_errands=max_concurrent_animal_errands,
     )
 
     return {"farmer": farmer_action, "hands": hands_actions, "market": market_orders}
@@ -873,7 +880,8 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
 
 def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive,
                   endgame, wind_down, remaining_days, animal_build_targets,
-                  empty_structures, tiles, board_size, unlocked_shops):
+                  empty_structures, tiles, board_size, unlocked_shops,
+                  max_concurrent_animal_errands):
     orders = []
     money = me.get("money", 0)
     prices = market.get("prices", {}) or {}
@@ -967,40 +975,23 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
             budget -= 1
             money -= cost
 
-    # --- BUY_SEED: keep a small buffer per crop we intend to keep planting.
-    # During bootstrap, prioritize wheat/carrot (fast payback) over the
-    # higher-steady-state-value but slow-to-mature tomato/strawberry/melon,
-    # so early cash flow isn't starved waiting on an 8-10 day first harvest.
-    if budget > 0 and not wind_down:
-        def seed_key(c):
-            is_fast = c in BOOTSTRAP_CROPS
-            return (0 if (bootstrapping and is_fast) else 1, -_crop_score(c, prices, market_inventory, unlocked_shops))
-
-        for crop in sorted(CROPS, key=seed_key):
-            if budget <= 0:
-                break
-            have = seeds.get(crop, 0)
-            target_buffer = 4
-            if have >= target_buffer:
-                continue
-            need = target_buffer - have
-            cost_each = CROPS[crop]["seed"]
-            reserve = 200
-            afford = max(0, int((money - reserve) // cost_each)) if cost_each > 0 else 0
-            n = min(need, afford, 6)
-            if n > 0:
-                orders.append(["BUY_SEED", crop, n])
-                money -= n * cost_each
-                budget -= 1
-
-    # --- BUY_ANIMAL: only when we actually have (or are about to have) a home
-    # for it -- either an existing empty structure or a build site planned
-    # specifically for this animal (see _plan_expansion) -- so a purchase
-    # never idles in the shed with nowhere to go (which would also eat into
-    # shedCapacity headroom). Also gated on an established wheat supply -- an
-    # animal placed before we can feed it daily starves and escapes within
-    # two days, losing the full purchase.
+    # --- BUY_ANIMAL, then matching feed, before BUY_SEED: hired hands need
+    # several turns just to walk from the shed to wherever they're needed, so
+    # they go out first (above) to start that walk immediately. Animals and
+    # their feed both have to be physically carried out of the shed by a
+    # unit, so they come next. Seeds don't -- BUY_SEED fills private["seeds"],
+    # which PLANT draws from directly wherever a unit already stands, no shed
+    # trip involved -- so seeds can safely wait for whatever budget is left.
+    #
+    # Only buy when we actually have (or are about to have) a home for it --
+    # either an existing empty structure or a build site planned specifically
+    # for this animal (see _plan_expansion) -- so a purchase never idles in
+    # the shed with nowhere to go (which would also eat into shedCapacity
+    # headroom). Also gated on an established wheat supply -- an animal
+    # placed before we can feed it daily starves and escapes within two days,
+    # losing the full purchase.
     wheat_established = projected_shed.get("WHEAT", 0) >= ANIMAL_WHEAT_GATE or day >= 6
+    animals_bought_this_turn = 0
     if budget > 0 and not wind_down and shed_total < 90 and wheat_established:
         remaining_structures = {
             "COOP": len(empty_structures.get("COOP", [])),
@@ -1022,12 +1013,14 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
                 continue
             # "homes" counts every planned build site the expansion planner is
             # willing to speculate on, which can be many more than the fetch
-            # pipeline actually processes per turn (throttled on purpose, see
-            # fetch_slots above, to keep most of the workforce on watering).
-            # Buying up to that generous limit just parks money as dead
-            # capital sitting unfetched in the shed for a long time -- cap the
-            # unfetched backlog small so purchases track actual throughput.
-            if projected_shed.get(animal, 0) >= 2:
+            # pipeline actually processes per turn -- fetching is throttled on
+            # purpose (see max_concurrent_animal_errands / fetch_slots) to
+            # keep most of the workforce on watering. Buying up to that
+            # generous "homes" limit just parks money as dead capital sitting
+            # unfetched in the shed for a long time, so cap the unfetched
+            # backlog to what that same throttle can actually work through at
+            # once, instead of an arbitrary number.
+            if projected_shed.get(animal, 0) >= max_concurrent_animal_errands:
                 continue
             cost = ANIMALS[animal]["cost"]
             reserve = 400
@@ -1035,23 +1028,60 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
                 orders.append(["BUY_ANIMAL", animal, 1])
                 money -= cost
                 budget -= 1
+                animals_bought_this_turn += 1
                 if remaining_structures.get(struct, 0) > 0:
                     remaining_structures[struct] -= 1
                 else:
                     build_targets_for[animal] -= 1
 
-    # --- BUY_PRODUCT WHEAT: emergency feed stopgap only, never the primary
-    # source (growing wheat is far cheaper than buying it back).
-    if budget > 0 and n_animals_alive > 0 and shed_total < 95:
+    # --- BUY_PRODUCT WHEAT: top up the shed to cover both animals already
+    # placed and needing today's feed, and any just bought above -- the fetch
+    # errand grabs a day's wheat in the same shed stop as the animal (see 2a)
+    # only when the shed actually has some right then, so buying it alongside
+    # the animal is what makes that "take the animal AND its feed together"
+    # sequencing actually land on the very first trip instead of waiting for
+    # a farmed surplus that may not exist yet. Still just a stopgap on top of
+    # normal wheat farming, never the primary source (growing it is cheaper).
+    if budget > 0 and (n_animals_alive + animals_bought_this_turn) > 0 and shed_total < 95:
         have_wheat = projected_shed.get("WHEAT", 0)
-        if have_wheat < n_animals_alive:
-            deficit = n_animals_alive - have_wheat
+        needed = n_animals_alive + animals_bought_this_turn
+        if have_wheat < needed:
+            deficit = needed - have_wheat
             price = prices.get("WHEAT", BASE_PRICE["WHEAT"])
             reserve = 100
             afford = max(0, int((money - reserve) // max(price, 1)))
             n = min(deficit, afford, 10)
             if n > 0:
                 orders.append(["BUY_PRODUCT", "WHEAT", n])
+                budget -= 1
+
+    # --- BUY_SEED: keep a small buffer per crop we intend to keep planting.
+    # Goes last -- seeds need no shed trip (PLANT draws from private["seeds"]
+    # wherever a unit stands), so they're the least urgent use of the
+    # remaining order budget. During bootstrap, prioritize wheat/carrot (fast
+    # payback) over the higher-steady-state-value but slow-to-mature
+    # tomato/strawberry/melon, so early cash flow isn't starved waiting on an
+    # 8-10 day first harvest.
+    if budget > 0 and not wind_down:
+        def seed_key(c):
+            is_fast = c in BOOTSTRAP_CROPS
+            return (0 if (bootstrapping and is_fast) else 1, -_crop_score(c, prices, market_inventory, unlocked_shops))
+
+        for crop in sorted(CROPS, key=seed_key):
+            if budget <= 0:
+                break
+            have = seeds.get(crop, 0)
+            target_buffer = 4
+            if have >= target_buffer:
+                continue
+            need = target_buffer - have
+            cost_each = CROPS[crop]["seed"]
+            reserve = 200
+            afford = max(0, int((money - reserve) // cost_each)) if cost_each > 0 else 0
+            n = min(need, afford, 6)
+            if n > 0:
+                orders.append(["BUY_SEED", crop, n])
+                money -= n * cost_each
                 budget -= 1
 
     return orders[:10]
