@@ -504,6 +504,69 @@ def _nearest(positions, pos):
 
 
 # ---------------------------------------------------------------------------
+# Fixed NW-quadrant routes (single-quadrant opening only)
+# ---------------------------------------------------------------------------
+# A hand-designed walking loop for the free starting (NW) quadrant, replacing
+# "nearest free unit takes nearest task" with three fixed loops (one per
+# hired hand #1-3, crops only) plus five dedicated animal tiles for the
+# farmer and hand #4 -- worked out by hand against the real action-cost
+# figures (ACTIONS_PER_DAY) so each loop's daily workload fits one unit.
+# Only applies while NW is still the only unlocked quadrant (see `only_nw`
+# in agent()); once a second quadrant opens this reverts entirely to the
+# general nearest-task system, which already covers arbitrary land shapes
+# and isn't hand-tuned to one specific 25-tile layout.
+NW_CROP_ROUTES = {
+    1: [(2, 4), (1, 4), (0, 4), (0, 3), (0, 2), (0, 1), (0, 0)],
+    2: [(2, 3), (1, 3), (1, 2), (2, 2), (2, 1), (1, 1), (1, 0)],
+    3: [(3, 2), (3, 1), (4, 1), (4, 0), (3, 0), (2, 0)],
+}
+NW_ROUTE_TILES = frozenset(pos for route in NW_CROP_ROUTES.values() for pos in route)
+NW_ANIMAL_TILES = [(4, 4), (3, 4), (4, 3), (3, 3), (4, 2)]
+
+
+def _route_next_target(route, tiles, day, seeds, board_size):
+    """First tile in `route` (fixed order, always scanned from the start)
+    that still has real work today: ripe (harvest first -- no point
+    watering something about to be cleared this same turn), else needs
+    watering, else empty with a seed on hand to plant. Once a tile is
+    watered for the day it stops matching and the scan naturally moves on
+    to whatever's next in the loop -- no stored "where was I" state needed,
+    matching the rest of this bot's stateless-recompute design; a unit that
+    fell behind yesterday just resumes at the first undone stop today."""
+    for pos in route:
+        tile = _tile_at(tiles, pos, board_size)
+        if tile is None:
+            if any(seeds.get(c, 0) > 0 for c in CROPS):
+                return pos, "PLANT"
+            continue
+        if not isinstance(tile, dict) or tile.get("kind") != "PLANT":
+            continue
+        if _plant_ready_to_harvest(tile, day):
+            return pos, "HARVEST"
+        if not tile["watered_today"]:
+            return pos, "WATER"
+    return None, None
+
+
+def _best_route_crop(seeds, day, market_inventory, unlocked_shops, standing_production, cfg, route_crop_counts):
+    """Which crop to plant on a fixed-route tile: the real projected score
+    (see _crop_score) among what's actually in hand, same as the general
+    expansion planner -- but respecting the same soft diversification cap
+    (_pick_diversified/TILE_SHARE_CAP) it uses too, not a raw max. Skipping
+    that (tried first) let the single highest-scoring crop (tomato/melon,
+    both slow to first harvest) claim every fixed-route tile at once,
+    starving early cash flow for a week+ with nothing sellable yet --
+    wheat/carrot's fast first_yield_day never wins on score alone."""
+    ranked = sorted(
+        (c for c in CROPS if seeds.get(c, 0) > 0),
+        key=lambda c: -_crop_score(c, day, market_inventory, unlocked_shops, standing_production, cfg),
+    )
+    if not ranked:
+        return None
+    return _pick_diversified(ranked, route_crop_counts, len(NW_ROUTE_TILES))
+
+
+# ---------------------------------------------------------------------------
 # Main agent
 # ---------------------------------------------------------------------------
 
@@ -570,6 +633,11 @@ def agent(obs, configuration=None):
     # than we can actually work through concurrently.
     max_concurrent_animal_errands = max(1, n_units // 4)
 
+    # While NW is still the only unlocked quadrant, hands #1-3 and the animal
+    # tiles follow the fixed NW_CROP_ROUTES/NW_ANIMAL_TILES layout below
+    # instead of the general nearest-task system (see that section for why).
+    only_nw = list(me.get("unlocked_quadrants", ["NW"])) == ["NW"] and board_size == 10
+
     # ------------------------------------------------------------------
     # 1. Build the prioritized task list from farm tiles (one grid pass).
     #    tier 1:   FEED / WATER (critical -- must happen today)
@@ -590,6 +658,8 @@ def agent(obs, configuration=None):
         tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
         market_inventory, unlocked_shops, shed, max_concurrent_animal_errands,
         standing_production, cfg, n_units,
+        excluded_positions=NW_ROUTE_TILES if only_nw else frozenset(),
+        forced_animal_tiles=NW_ANIMAL_TILES if only_nw else None,
     )
 
     empty_structures = {"COOP": [], "PASTURE": []}
@@ -616,6 +686,12 @@ def agent(obs, configuration=None):
             if kind == "WEED":
                 tasks[3].append(("DIG", (x, y), None))
             elif kind == "PLANT":
+                # Fixed-route crop tiles are worked directly by their owning
+                # hand below (see NW_CROP_ROUTES), never through this general
+                # pool -- skip them here so the farmer/hand #4 never end up
+                # pulled onto crop duty instead of the animal tiles they own.
+                if only_nw and (x, y) in NW_ROUTE_TILES:
+                    continue
                 if not tile["watered_today"]:
                     tasks[1].append(("WATER", (x, y), None))
                 if _plant_ready_to_harvest(tile, day):
@@ -696,6 +772,81 @@ def agent(obs, configuration=None):
     # ------------------------------------------------------------------
     unit_actions = [None] * n_units
     projected_shed = dict(shed)
+    shed_tile_set = set(shed_tiles)
+
+    # 2y. Fixed NW routes for hands #1-3 (crops only), while NW is still the
+    # only unlocked quadrant -- set before anything else below so those
+    # units are never "free" for the general pools (2a's own already-set
+    # check sits mid-function, after its fertilizer/animal-cargo checks, but
+    # those never match here since these hands never carry either). Each
+    # hand walks its fixed loop in order every day; when its own loop has
+    # nothing left to do today, it looks across *all three* loops for any
+    # other tile still needing work (a hand that ran short helps a hand
+    # that's behind) rather than sitting idle or drifting onto animal duty.
+    if only_nw:
+        pending_owner = {}
+        for hand_idx, route in NW_CROP_ROUTES.items():
+            if hand_idx >= n_units:
+                continue
+            pos, op = _route_next_target(route, tiles, day, seeds, board_size)
+            if pos is not None:
+                pending_owner[hand_idx] = (pos, op)
+
+        route_crop_counts = {}
+        for rx, ry in NW_ROUTE_TILES:
+            rt = tiles[ry][rx]
+            if isinstance(rt, dict) and rt.get("kind") == "PLANT":
+                route_crop_counts[rt["crop"]] = route_crop_counts.get(rt["crop"], 0) + 1
+
+        for hand_idx, route in NW_CROP_ROUTES.items():
+            if hand_idx >= n_units:
+                continue
+            cur = tuple(units[hand_idx])
+            inv = inventories[hand_idx] if hand_idx < len(inventories) else {}
+
+            target = pending_owner.get(hand_idx)
+            if target is None:
+                # Own loop is clear for today -- help wherever else on the
+                # combined 20-tile crop layout still needs something,
+                # nearest first.
+                candidates = list(pending_owner.values())
+                if candidates:
+                    target = min(candidates, key=lambda t: _manhattan(cur, t[0]))
+            if target is None:
+                # Nothing left anywhere on the 20-tile crop layout today --
+                # *now* worth the trip to the shed with whatever's piled up.
+                # None of NW_CROP_ROUTES passes a shed tile (by design --
+                # see NW_ANIMAL_TILES, which sit between the routes and the
+                # shed), and there's no cap on a unit's own carried
+                # inventory in the engine, so cutting the route short
+                # earlier to drop off a partial load costs a real detour
+                # for no real gain -- better to run the whole loop first
+                # and cash in once, at the end of the day's work.
+                cargo = sum(v for k, v in inv.items() if k not in ANIMALS)
+                if cargo <= 0:
+                    unit_actions[hand_idx] = ["PASS"]
+                elif cur in shed_tile_set:
+                    unit_actions[hand_idx] = ["DROP"]
+                    for item, n in inv.items():
+                        room = max(0, 100 - sum(projected_shed.values()))
+                        take = min(n, room)
+                        if take > 0:
+                            projected_shed[item] = projected_shed.get(item, 0) + take
+                else:
+                    drop_target = _nearest(shed_tiles, cur)
+                    unit_actions[hand_idx] = [_step_towards(cur, drop_target, board_size)]
+                continue
+            pos, op = target
+            if cur == pos:
+                if op == "PLANT":
+                    crop = _best_route_crop(seeds, day, market_inventory, unlocked_shops, standing_production, cfg, route_crop_counts)
+                    unit_actions[hand_idx] = ["PLANT", crop] if crop else ["PASS"]
+                    if crop:
+                        route_crop_counts[crop] = route_crop_counts.get(crop, 0) + 1
+                else:
+                    unit_actions[hand_idx] = [op]
+            else:
+                unit_actions[hand_idx] = [_step_towards(cur, pos, board_size)]
 
     # 2z. Absolute top priority, ahead of even cargo/delivery logic below: if a
     # unit is already standing on a tile that needs watering or feeding right
@@ -720,6 +871,8 @@ def agent(obs, configuration=None):
     care_by_pos = {t[1]: t for t in tasks[3] if t[0] == "CARE"}
     tier4_by_pos = {t[1]: t for t in tasks[4]}
     for i in range(n_units):
+        if unit_actions[i] is not None:
+            continue  # already locked onto a fixed NW route (see 2y above)
         pos = tuple(units[i])
         inv_i = inventories[i] if i < len(inventories) else {}
         # FEED consumes 1 WHEAT from the *acting unit's own inventory* (not
@@ -741,12 +894,12 @@ def agent(obs, configuration=None):
             tasks[4].remove((op, tpos, extra))
             unit_actions[i] = _finalize_tile_action(op, extra)
 
-    shed_tile_set = set(shed_tiles)
-
     # 2a. Units already carrying fertilizer / an animal act on that cargo first
     # (deliver-in-progress takes priority over starting something new).
     feed_targets = [t[1] for t in tasks[1] if t[0] == "FEED"]
     for i in range(n_units):
+        if unit_actions[i] is not None:
+            continue  # already locked onto a fixed NW route (see 2y above)
         pos = tuple(units[i])
         inv = inventories[i] if i < len(inventories) else {}
         tile = _tile_at(tiles, pos, board_size)
@@ -808,8 +961,14 @@ def agent(obs, configuration=None):
             # unit claims it first, which just costs one extra turn to
             # retarget, not indefinite wandering.)
             build_op = "BUILD_COOP" if struct == "COOP" else "BUILD_PASTURE"
+            # While NW is the only unlocked quadrant, animal structures only
+            # ever go on the 5 reserved NW_ANIMAL_TILES -- some of those tie
+            # in shed-distance with fixed-route crop tiles (see NW_CROP_ROUTES),
+            # so picking blindly from every empty tile could steal a route
+            # tile out from under hand #1-3 and break their loop.
+            build_candidates = [p for p in NW_ANIMAL_TILES if p in set(all_empty_tiles)] if only_nw else all_empty_tiles
             target = min(
-                all_empty_tiles,
+                build_candidates,
                 key=lambda p: min(_manhattan(p, st) for st in shed_tiles),
                 default=None,
             )
@@ -1054,13 +1213,18 @@ def _pick_diversified(ranked, counts, unlocked_tiles):
 
 def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
                      market_inventory, unlocked_shops, shed, max_concurrent_animal_errands,
-                     standing_production, cfg, n_units):
+                     standing_production, cfg, n_units, excluded_positions=frozenset(),
+                     forced_animal_tiles=None):
     """Decide what goes on currently-empty tiles: returns (plant_targets,
     animal_build_targets, my_action_demand), the first two {(x, y): value}
     splitting the empty-tile pool between crops and new animal structures
     respecting soft diversification caps, the third the projected total daily
     task-action demand (ACTIONS_PER_DAY) from this farm's tiles including
-    what's newly planned here -- fed back to _plan_market to size hiring."""
+    what's newly planned here -- fed back to _plan_market to size hiring.
+    `excluded_positions` are left out of the empty-tile pool entirely (used
+    for NW_CROP_ROUTES tiles, worked directly by their owning hand instead);
+    `forced_animal_tiles`, when given, replaces the usual "nearest N empty
+    tiles" animal-site pick with this exact list (used for NW_ANIMAL_TILES)."""
     empty = []
     crop_counts = {c: 0 for c in CROPS}
     animal_counts = {a: 0 for a in ANIMALS}
@@ -1073,7 +1237,8 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
                 continue
             unlocked_tiles += 1
             if tile is None:
-                empty.append((x, y))
+                if (x, y) not in excluded_positions:
+                    empty.append((x, y))
             elif isinstance(tile, dict):
                 if tile.get("kind") == "PLANT":
                     crop_counts[tile["crop"]] = crop_counts.get(tile["crop"], 0) + 1
@@ -1135,6 +1300,11 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
     owned_needing_site = sum(need_new_site.values())
     if wind_down:
         animal_slots, crop_slots = [], empty
+    elif forced_animal_tiles is not None:
+        empty_set = set(empty)
+        forced_set = set(forced_animal_tiles)
+        animal_slots = [p for p in forced_animal_tiles if p in empty_set]
+        crop_slots = [p for p in empty if p not in forced_set]
     else:
         n_animal_slots = min(len(empty), owned_needing_site + speculative)
         animal_slots, crop_slots = empty[:n_animal_slots], empty[n_animal_slots:]
