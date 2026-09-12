@@ -256,6 +256,30 @@ def _projected_price(item, days_ahead, market_inventory, unlocked_shops, standin
 # the opponent does still nets more total revenue," not in this constant --
 # left at the old (undervaluing) numbers until that's sorted out, since they
 # measurably outperform the correct ones under the current projection.
+#
+# Tried once already: widen _consumption_per_day's projection to account for
+# shop slots expected to unlock between now and each product's horizon
+# (shops unlock deterministically in COUNT -- min(8, day // interval),
+# verified exactly against all 247 real replays -- even though WHICH of the 8
+# types fills each slot is random), on the theory that _projected_price was
+# freezing consumption at today's shop count and so understating future
+# demand, making future oversupply look scarier than it really is. Confirmed
+# via the same 247 replays that "8 shop slots is enough to have unlocked
+# every type in expectation" holds, so the projection is fine per se -- but
+# plugging it into _projected_price for ALL products (not just cows/sheep)
+# and re-testing the corrected 1.5/1.333 numbers on top of it still net
+# REGRESSED the 10-seed vs_starter average (~31,326 vs ~31,883 baseline,
+# 6/10 seeds worse) and, tellingly, changing COW/SHEEP's yield constant made
+# *zero* difference to the final tile allocation once this wider projection
+# was in place (some other factor -- likely TILE_SHARE_CAP or the capacity
+# gate -- became the binding constraint before the yield-driven score gap
+# could change the pick order). So the earlier diagnosis (this constant
+# feeding _standing_production_per_day makes _animal_score too conservative)
+# was real but this particular counter-lever doesn't reach it; reverted.
+# Next angle to try: separate the number used to value a single animal's OWN
+# future revenue from the number used to project the *combined* market's
+# future supply -- i.e. two constants instead of one, rather than trying to
+# fix it by inflating the demand side further.
 YIELD_PER_TILE_DAY = {
     "WHEAT": 1.5, "CARROT": 1.333, "TOMATO": 4.0, "STRAWBERRY": 2.0, "MELON": 0.5,
     "GOOSE": 2.0, "COW": 1.0, "SHEEP": 0.67,
