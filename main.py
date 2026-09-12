@@ -232,10 +232,64 @@ def _projected_price(item, days_ahead, market_inventory, unlocked_shops, standin
 
 # Max sellable yield per tile per day at optimal (unfertilized) care -- matches
 # the README's own table; used to rank crop/animal ROI.
+#
+# TODO(cow/sheep yield): simulating _daily_refresh_animals directly confirms
+# the *steady-state* rate with daily feed+care+harvest is higher than what's
+# used below -- the very first payout is an outsized one-off (it banks
+# care/feed over the long first_yield_day ramp, far longer than the animal's
+# own production interval), but every payout after that only has `interval`
+# days to rebank, capping steady state well under the first-harvest number.
+# Confirmed: COW settles at 3 MILK every 2 days (1.5/day, not the 1.0 below)
+# and SHEEP at 4 WOOL every 3 days (1.33/day, not 0.67). Plugging those
+# corrected numbers in here measurably regressed several seeds' final
+# reward, though -- e.g. seed 1 vs starter: 6 COW + 2 SHEEP / $30,072 with
+# the numbers below, only 2 COW + 1 SHEEP / $27,498 with the "correct" ones.
+# Root cause isn't capacity (disabling the new CAPACITY_MARGIN gate entirely
+# changes nothing) -- it's that a higher YIELD_PER_TILE_DAY also raises
+# standing_production's assumed per-animal output (see
+# _standing_production_per_day), which _projected_price reads as *this much
+# more* future oversupply from cows already out there, so _animal_score
+# turns more conservative sooner than it should and the bot ends up buying
+# fewer animals overall, even though each individual one is now scored more
+# accurately. The fix likely belongs in how the projection weighs "my own
+# future supply discourages more of the same" against "grabbing share before
+# the opponent does still nets more total revenue," not in this constant --
+# left at the old (undervaluing) numbers until that's sorted out, since they
+# measurably outperform the correct ones under the current projection.
 YIELD_PER_TILE_DAY = {
     "WHEAT": 1.5, "CARROT": 1.333, "TOMATO": 4.0, "STRAWBERRY": 2.0, "MELON": 0.5,
     "GOOSE": 2.0, "COW": 1.0, "SHEEP": 0.67,
 }
+
+# Recurring daily task-action cost of keeping one tile of this type running,
+# once past its one-time setup (planting, or fetch+build+place for an
+# animal) -- verified by simulating the actual daily-care cycle rather than
+# guessed: animals need FEED+CARE+COLLECT_FERTILIZER *every* day (skipping
+# any day costs far more steady-state yield than the one action it saves --
+# simulated: cow fed every day nets ~1.35 MILK/day over 40 days, fed every
+# other day nets only ~0.4 -- the bonus-banking math punishes gaps much more
+# than proportionally, so "every day" is the right regime to cost, not a
+# cheaper alternative), plus HARVEST averaged over how often it's actually
+# available (every `interval` days). Crops need WATER *every* day with zero
+# slack at all (a fresh planting starts at consecutive_unwatered=1; one more
+# miss and it's already a weed) -- one-time crops (wheat/carrot/melon) are
+# costed per full plant-to-harvest cycle (which then replants, so this is
+# their steady-state rate too); tomato/strawberry are "ongoing" and never
+# replant, so this is water + harvest/interval indefinitely.
+ACTIONS_PER_DAY = {
+    "WHEAT": 7 / 5, "CARROT": 6 / 4, "MELON": 13 / 11,   # (plant + water*n + harvest) / cycle_days
+    "TOMATO": 2.0, "STRAWBERRY": 1.5,                     # water + harvest/interval, forever
+    "GOOSE": 4.0, "COW": 3.5, "SHEEP": 10 / 3,            # feed+care+fertilizer daily + harvest/interval
+}
+
+# Capacity is sized off action-count alone (ACTIONS_PER_DAY), which only
+# counts standing on the tile doing the task -- not the walk there and back,
+# which is real and grows with how spread out the farm is. This margin is a
+# blunt stand-in for that unmodeled travel overhead (and for CARE/DIG/etc. on
+# tiles not covered by ACTIONS_PER_DAY), not a measured number -- TODO: a
+# real travel-time estimate (e.g. from average distance to shed) would let
+# this be tighter and more honest than a flat haircut.
+CAPACITY_MARGIN = 0.7
 
 # Rough amortized upfront-cost-per-day (seed/animal cost spread over a typical
 # productive lifetime), so expensive slow-starters don't look artificially
@@ -438,10 +492,10 @@ def agent(obs, configuration=None):
     # ------------------------------------------------------------------
     tasks = {1: [], 1.5: [], 2: [], 3: [], 4: []}
 
-    plant_targets, animal_build_targets = _plan_expansion(
+    plant_targets, animal_build_targets, my_action_demand = _plan_expansion(
         tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
         market_inventory, unlocked_shops, shed, max_concurrent_animal_errands,
-        standing_production, cfg,
+        standing_production, cfg, n_units,
     )
 
     empty_structures = {"COOP": [], "PASTURE": []}
@@ -826,6 +880,7 @@ def agent(obs, configuration=None):
         tiles=tiles, board_size=board_size, unlocked_shops=unlocked_shops,
         max_concurrent_animal_errands=max_concurrent_animal_errands,
         standing_production=standing_production, cfg=cfg,
+        my_action_demand=my_action_demand,
     )
 
     return {"farmer": farmer_action, "hands": hands_actions, "market": market_orders}
@@ -905,10 +960,13 @@ def _pick_diversified(ranked, counts, unlocked_tiles):
 
 def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
                      market_inventory, unlocked_shops, shed, max_concurrent_animal_errands,
-                     standing_production, cfg):
-    """Decide what goes on currently-empty tiles: returns (plant_targets, animal_build_targets),
-    both {(x, y): value}, splitting the empty-tile pool between crops and new
-    animal structures and respecting soft diversification caps."""
+                     standing_production, cfg, n_units):
+    """Decide what goes on currently-empty tiles: returns (plant_targets,
+    animal_build_targets, my_action_demand), the first two {(x, y): value}
+    splitting the empty-tile pool between crops and new animal structures
+    respecting soft diversification caps, the third the projected total daily
+    task-action demand (ACTIONS_PER_DAY) from this farm's tiles including
+    what's newly planned here -- fed back to _plan_market to size hiring."""
     empty = []
     crop_counts = {c: 0 for c in CROPS}
     animal_counts = {a: 0 for a in ANIMALS}
@@ -930,8 +988,20 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
                 elif tile.get("kind") in empty_structure_counts:
                     empty_structure_counts[tile["kind"]] += 1
 
+    standing_demand = (
+        sum(n * ACTIONS_PER_DAY[c] for c, n in crop_counts.items())
+        + sum(n * ACTIONS_PER_DAY[a] for a, n in animal_counts.items())
+    )
     if not empty or unlocked_tiles == 0:
-        return {}, {}
+        return {}, {}, standing_demand
+
+    # How much more daily task-action demand we can add before the workforce
+    # is projected to be underwater -- see ACTIONS_PER_DAY/CAPACITY_MARGIN.
+    # Only gates speculative (not-yet-owned) new animal sites below, not
+    # sunk-cost ones (already paid for -- see there) and not crops (see
+    # there too): the "even if profitable, we can't staff it all" case this
+    # exists for is specifically about animals.
+    free_capacity = max(0.0, n_units * 24 * CAPACITY_MARGIN - standing_demand)
 
     # Fill outward from the shed first: keeps the day's work clustered near
     # the drop-off point instead of scattering across the whole unlocked
@@ -975,6 +1045,38 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
         n_animal_slots = min(len(empty), owned_needing_site + speculative)
         animal_slots, crop_slots = empty[:n_animal_slots], empty[n_animal_slots:]
 
+    # Capacity only gates *speculative* (not-yet-owned) new animals here, not
+    # crops: an empty tile isn't spare workforce held in reserve, it's a
+    # standing weed risk (weeds spawn only on empty tiles) that needs digging
+    # regardless of whether we "meant" to leave it empty for capacity
+    # reasons -- leaving land unplanted to save labor was measurably worse
+    # (more weeds to dig, not less work overall) when tried. Animals are
+    # different: skipping one doesn't create a weed risk, and a placed one
+    # that can't be kept fed reliably escapes outright, losing the purchase
+    # -- so the "even if profitable, we can't staff it all" concern this
+    # exists for is real specifically here, not for crops. Sunk-cost animals
+    # (already paid for) still bypass the gate below same as always.
+    animal_build_targets = {}
+    if animal_slots:
+        reserve = 400
+        for pos in animal_slots:
+            pending = [a for a in ranked_animals if need_new_site.get(a, 0) > 0]
+            if pending:
+                best = _pick_diversified(pending, animal_counts, unlocked_tiles)
+                need_new_site[best] -= 1
+            else:
+                if free_capacity < min(ACTIONS_PER_DAY[a] for a in ANIMALS):
+                    break  # workforce is already projected at capacity
+                best = _pick_diversified(ranked_animals, animal_counts, unlocked_tiles)
+                if money - reserve < ANIMALS[best]["cost"]:
+                    continue  # don't plan a site for a purchase we can't afford yet
+                free_capacity -= ACTIONS_PER_DAY[best]
+                standing_demand += ACTIONS_PER_DAY[best]
+            struct = ANIMALS[best]["structure"]
+            op = "BUILD_COOP" if struct == "COOP" else "BUILD_PASTURE"
+            animal_build_targets[pos] = (op, best)  # (build op, which animal it's for)
+            animal_counts[best] = animal_counts.get(best, 0) + 1
+
     plant_targets = {}
     if not wind_down or remaining_days >= 4:
         ranked_crops = sorted(
@@ -986,25 +1088,9 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
                 crop = _pick_diversified(ranked_crops, crop_counts, unlocked_tiles)
                 plant_targets[pos] = crop
                 crop_counts[crop] = crop_counts.get(crop, 0) + 1
+                standing_demand += ACTIONS_PER_DAY[crop]
 
-    animal_build_targets = {}
-    if animal_slots:
-        reserve = 400
-        for pos in animal_slots:
-            pending = [a for a in ranked_animals if need_new_site.get(a, 0) > 0]
-            if pending:
-                best = _pick_diversified(pending, animal_counts, unlocked_tiles)
-                need_new_site[best] -= 1
-            else:
-                best = _pick_diversified(ranked_animals, animal_counts, unlocked_tiles)
-                if money - reserve < ANIMALS[best]["cost"]:
-                    continue  # don't plan a site for a purchase we can't afford yet
-            struct = ANIMALS[best]["structure"]
-            op = "BUILD_COOP" if struct == "COOP" else "BUILD_PASTURE"
-            animal_build_targets[pos] = (op, best)  # (build op, which animal it's for)
-            animal_counts[best] = animal_counts.get(best, 0) + 1
-
-    return plant_targets, animal_build_targets
+    return plant_targets, animal_build_targets, standing_demand
 
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1100,8 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
 def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive,
                   endgame, wind_down, remaining_days, animal_build_targets,
                   empty_structures, tiles, board_size, unlocked_shops,
-                  max_concurrent_animal_errands, standing_production, cfg):
+                  max_concurrent_animal_errands, standing_production, cfg,
+                  my_action_demand):
     orders = []
     money = me.get("money", 0)
     prices = market.get("prices", {}) or {}
@@ -1061,21 +1148,44 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
         orders.append(["SELL", item, qty])
         budget -= 1
 
-    # --- HIRE: once per day, at hour 0, scaled to how much land/work exists.
+    # --- HIRE: once per day, at hour 0. Hands are lost every single day
+    # (farm["hands"]=[] at end of day, hires_today resets to 0) so this cost
+    # is *recurring*, not one-time: the Nth hire costs fib(N-1) again every
+    # day it's kept, not once (the 16th alone is ~$987/day, every day --
+    # holding 16 hands costs ~$2583/day in hiring alone).
+    #
+    # Sized off the real daily task-action demand from tiles already
+    # planted/placed (my_action_demand, from ACTIONS_PER_DAY -- see
+    # _plan_expansion) rather than a rough tile-count guess, but never
+    # *less* than the old land-based floor: at day 0 nothing is planted yet
+    # (demand is 0), and hands have to exist first for _plan_expansion to
+    # have anyone to staff a planting with.
     if hour == 0 and budget > 0:
         planted_or_building = sum(
             1 for row in tiles for t in row
             if isinstance(t, dict) and t.get("kind") in ("PLANT", "COOP", "PASTURE")
         )
         unlocked_tiles = sum(1 for row in tiles for t in row if t != "LOCKED")
-        # Coverage, not cash, is the binding constraint on a spread-out farm --
-        # an idle tile earns nothing regardless of how much money sits in the
-        # bank, and hiring stays cheap (fib-scaled from $1) well past the
-        # point where it pays for itself in a single day's extra harvesting.
-        target_hands = min(10, max(unlocked_tiles // 8, planted_or_building // 5))
-        # Hiring is cheap (fib-scaled from $1) and hands are the single best
-        # lever for covering more tiles -- don't let a large fixed reserve
-        # block it the way a flat $300 floor would once cash is tight.
+        land_based_floor = min(10, max(unlocked_tiles // 8, planted_or_building // 5))
+        demand_based = math.ceil(my_action_demand / (24 * CAPACITY_MARGIN)) - 1  # minus the farmer, always free
+        target_hands = min(20, max(land_based_floor, demand_based))
+
+        # TODO(hire ROI): the user's own framing -- hire only while the next
+        # hand's (recurring, Fibonacci) cost is still less than the profit
+        # its work brings in -- is right in principle but genuinely unsolved
+        # here. Tried comparing fib(n) against a blended $-per-action average
+        # across every standing tile; measured *worse* (regressed several
+        # seeds' final reward): one crashed-price tile (melon sits near the
+        # floor most games) drags the whole average down and starves hiring
+        # even while plenty of other tiles are still very profitable, which
+        # then lets weeds/upkeep fall behind, which drags the average down
+        # further -- a real negative feedback loop, not a rounding error.
+        # A fix needs the marginal hand's *actual* expected task (whatever's
+        # highest-value and unstaffed right now), not an average of
+        # everything already planted, plus real travel-time cost (which
+        # ACTIONS_PER_DAY doesn't count) -- until then, target_hands above
+        # (real workload, not a tile-count guess) is the load-bearing fix;
+        # affordability (the reserve check below) is the only brake on cost.
         reserve = min(150, max(20, money * 0.1))
         spend = 0
         hires = 0
