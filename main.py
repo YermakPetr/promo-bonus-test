@@ -802,7 +802,6 @@ def agent(obs, configuration=None):
             if hand_idx >= n_units:
                 continue
             cur = tuple(units[hand_idx])
-            inv = inventories[hand_idx] if hand_idx < len(inventories) else {}
 
             target = pending_owner.get(hand_idx)
             if target is None:
@@ -814,27 +813,14 @@ def agent(obs, configuration=None):
                     target = min(candidates, key=lambda t: _manhattan(cur, t[0]))
             if target is None:
                 # Nothing left anywhere on the 20-tile crop layout today --
-                # *now* worth the trip to the shed with whatever's piled up.
-                # None of NW_CROP_ROUTES passes a shed tile (by design --
-                # see NW_ANIMAL_TILES, which sit between the routes and the
-                # shed), and there's no cap on a unit's own carried
-                # inventory in the engine, so cutting the route short
-                # earlier to drop off a partial load costs a real detour
-                # for no real gain -- better to run the whole loop first
-                # and cash in once, at the end of the day's work.
-                cargo = sum(v for k, v in inv.items() if k not in ANIMALS)
-                if cargo <= 0:
-                    unit_actions[hand_idx] = ["PASS"]
-                elif cur in shed_tile_set:
-                    unit_actions[hand_idx] = ["DROP"]
-                    for item, n in inv.items():
-                        room = max(0, 100 - sum(projected_shed.values()))
-                        take = min(n, room)
-                        if take > 0:
-                            projected_shed[item] = projected_shed.get(item, 0) + take
-                else:
-                    drop_target = _nearest(shed_tiles, cur)
-                    unit_actions[hand_idx] = [_step_towards(cur, drop_target, board_size)]
+                # no need to walk cargo to the shed either: _end_of_day
+                # (_drop_inventories_to_shed) auto-empties *every* unit's
+                # inventory into the shed at the day boundary, capped at
+                # shedCapacity, seeds excluded from that cap entirely. A
+                # manual DROP trip here would just be a wasted detour (none
+                # of NW_CROP_ROUTES is shed-adjacent, by design), so just
+                # hold -- the day-end flush handles it for free.
+                unit_actions[hand_idx] = ["PASS"]
                 continue
             pos, op = target
             if cur == pos:
