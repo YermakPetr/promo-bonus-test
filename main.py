@@ -112,6 +112,21 @@ MARKET_I0 = 10000
 HINGE_SCARCITY = {"CARROT": 450, "TOMATO": 200, "EGG": 332}  # product -> T
 SCARCITY_WEIGHT = 30
 
+# Forward-looking oversupply signal, symmetric to the scarcity one above but
+# on the other side: every animal already standing on *either* player's map
+# (ours or the opponent's -- both farms' tiles are visible in the shared obs,
+# unlike shed/inventory/seeds, which are each player's own private section)
+# keeps dumping its product onto the market every production cycle whether
+# we've sold yet or not, so its price is heading down further regardless of
+# what the live price shows right now. Current price alone only reflects
+# supply already sold, same gap _demand_bonus's hinge term closes for
+# scarcity. Deliberately a flat per-head penalty rather than modeling the
+# real above-I0 price curve precisely (see the longer TODO on the animal
+# purchase decision near BUY_ANIMAL below) -- a coarse "more competing supply
+# already committed -> less attractive to add more" signal, tuned small so it
+# nudges the ranking rather than overriding price/cost/demand outright.
+SUPPLY_PRESSURE_WEIGHT = 4
+
 # Max sellable yield per tile per day at optimal (unfertilized) care -- matches
 # the README's own table; used to rank crop/animal ROI.
 YIELD_PER_TILE_DAY = {
@@ -283,6 +298,19 @@ def agent(obs):
         1 for row in tiles for t in row if isinstance(t, dict) and "animal" in t
     )
 
+    # How many of each animal are already placed on *either* player's map --
+    # both farms' tiles are visible in the shared obs (unlike shed/inventory,
+    # which are each player's own private section), so the opponent's
+    # standing supply of a product is knowable, not hidden. Used to steer
+    # BUY_ANIMAL away from adding to a type that's already heavily committed
+    # market-wide (see SUPPLY_PRESSURE_WEIGHT / _animal_score).
+    animals_in_play = {a: 0 for a in ANIMALS}
+    for f in farms:
+        for row in f["tiles"]:
+            for t in row:
+                if isinstance(t, dict) and t.get("animal") in animals_in_play:
+                    animals_in_play[t["animal"]] += 1
+
     # Same workforce-scaled number paces how many near-shed tiles get
     # reserved for animals (_plan_expansion), how many unfetched animals of
     # one type BUY_ANIMAL is willing to stockpile, and how many fetch errands
@@ -309,6 +337,7 @@ def agent(obs):
     plant_targets, animal_build_targets = _plan_expansion(
         tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
         market_inventory, unlocked_shops, shed, max_concurrent_animal_errands,
+        animals_in_play,
     )
 
     empty_structures = {"COOP": [], "PASTURE": []}
@@ -692,6 +721,7 @@ def agent(obs):
         animal_build_targets=animal_build_targets, empty_structures=empty_structures,
         tiles=tiles, board_size=board_size, unlocked_shops=unlocked_shops,
         max_concurrent_animal_errands=max_concurrent_animal_errands,
+        animals_in_play=animals_in_play,
     )
 
     return {"farmer": farmer_action, "hands": hands_actions, "market": market_orders}
@@ -765,12 +795,14 @@ def _crop_score(crop, prices, market_inventory, unlocked_shops):
     return base + _demand_bonus(crop, market_inventory, unlocked_shops)
 
 
-def _animal_score(animal, prices, market_inventory, unlocked_shops):
+def _animal_score(animal, prices, market_inventory, unlocked_shops, animals_in_play):
     product = ANIMAL_PRODUCT[animal]
     price = prices.get(product, BASE_PRICE[product])
     feed_cost_per_day = prices.get("WHEAT", BASE_PRICE["WHEAT"])  # ~1 wheat/day/animal
     base = YIELD_PER_TILE_DAY[animal] * price - AMORTIZED_COST_PER_DAY[animal] - feed_cost_per_day
-    return base + _demand_bonus(product, market_inventory, unlocked_shops)
+    demand = _demand_bonus(product, market_inventory, unlocked_shops)
+    supply_penalty = SUPPLY_PRESSURE_WEIGHT * animals_in_play.get(animal, 0)
+    return base + demand - supply_penalty
 
 
 def _pick_diversified(ranked, counts, unlocked_tiles):
@@ -788,7 +820,8 @@ def _pick_diversified(ranked, counts, unlocked_tiles):
 
 
 def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days, wind_down,
-                     market_inventory, unlocked_shops, shed, max_concurrent_animal_errands):
+                     market_inventory, unlocked_shops, shed, max_concurrent_animal_errands,
+                     animals_in_play):
     """Decide what goes on currently-empty tiles: returns (plant_targets, animal_build_targets),
     both {(x, y): value}, splitting the empty-tile pool between crops and new
     animal structures and respecting soft diversification caps."""
@@ -822,7 +855,7 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
     shed_tiles = _shed_access_tiles(board_size)
     empty.sort(key=lambda p: min(_manhattan(p, st) for st in shed_tiles))
 
-    ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops))
+    ranked_animals = sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops, animals_in_play))
     # Animals already bought and sitting in the shed are a sunk cost -- housing
     # them costs no more money and shouldn't be blocked by the affordability
     # gate below, which exists only to avoid planning a site for a
@@ -897,7 +930,7 @@ def _plan_expansion(tiles, board_size, seeds, prices, money, day, remaining_days
 def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive,
                   endgame, wind_down, remaining_days, animal_build_targets,
                   empty_structures, tiles, board_size, unlocked_shops,
-                  max_concurrent_animal_errands):
+                  max_concurrent_animal_errands, animals_in_play):
     orders = []
     money = me.get("money", 0)
     prices = market.get("prices", {}) or {}
@@ -1016,7 +1049,42 @@ def _plan_market(me, private, market, day, hour, projected_shed, n_animals_alive
         build_targets_for = {a: 0 for a in ANIMALS}
         for op, a in animal_build_targets.values():
             build_targets_for[a] += 1
-        for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops)):
+        # TODO(animal choice): this ranks COW/SHEEP/GOOSE by _animal_score
+        # (live price - amortized cost - feed cost + demand bonus - supply
+        # pressure) and, since the loop doesn't stop after the top pick, can
+        # still buy one of *each* type in the same turn if each independently
+        # clears its own gates below -- not obviously wrong (diversifying
+        # across products has real value, and each purchase is still scored
+        # on its own merit), but the scoring going into that ranking is
+        # cruder than it could be. Ideas raised for sharpening it, worth
+        # keeping even where we haven't built them yet:
+        #  - Already implemented: animals_in_play, a flat per-head penalty
+        #    for how many of this type are already standing on *either*
+        #    player's map (both farms' tiles are visible in the shared obs,
+        #    so the opponent's committed supply of a product is knowable,
+        #    not hidden) -- see SUPPLY_PRESSURE_WEIGHT above.
+        #  - Not implemented: model the actual above-I0 oversupply price
+        #    curve (how many units past I0 it takes for the first real price
+        #    break, same idea as HINGE_SCARCITY/SCARCITY_WEIGHT already does
+        #    for the scarcity side) instead of a flat per-head penalty, so
+        #    the estimate is "how much will price actually move" rather than
+        #    just "more existing supply is worse."
+        #  - Not implemented: project town consumption forward instead of
+        #    only looking at current price/inventory -- verified against the
+        #    installed engine (kaggriculture.py _town_consume): each shop
+        #    instance consumes its listed products every townShopSellInterval
+        #    steps (default 4, not 12), and the town center consumes 1 of
+        #    every non-fertilizer product every townCenterSellInterval steps
+        #    (default 24 = 1 day) -- flat rates, no day-10/20 consumption
+        #    ramp exists in this version (that part of the idea doesn't hold
+        #    up against the actual code, so don't encode it). What *is*
+        #    real and not yet modeled: which shops are unlocked now (checked
+        #    every 3 days -- townShopUnlockInterval, default 3 -- capped at
+        #    MAX_SHOP_INSTANCES=8, drawn randomly with replacement) sets a
+        #    known, deterministic near-term consumption floor per product
+        #    that a smarter score could project forward a few days instead
+        #    of only reading unlocked_shops as of right now.
+        for animal in sorted(ANIMALS, key=lambda a: -_animal_score(a, prices, market_inventory, unlocked_shops, animals_in_play)):
             if budget <= 0:
                 break
             struct = ANIMALS[animal]["structure"]
